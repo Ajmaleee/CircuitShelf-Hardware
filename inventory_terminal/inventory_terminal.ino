@@ -31,23 +31,53 @@
  *  - No frameworks, no CDN, no external assets — plain HTML/CSS only,
  *    all generated on-device.
  *
- * ---- Stage 4.5: session tools (extra step requested between 4 and 5) ----
- *  - Boot -> IDLE screen showing session UPTIME (since power-on), lent
- *    units, and the session's lend/return totals. Any key wakes it into
- *    a MENU (the wake keypress is swallowed, not acted on).
- *  - MENU: Search parts / Lent items / Timer / Pomodoro / Stopwatch.
+ * ---- Session tools (extra step requested between Stage 4 and 5) ----
+ *  - Boot -> IDLE screen: shows the real time-of-day if an RTC is
+ *    detected, otherwise falls back to session UPTIME — automatically,
+ *    with no crash either way. Also shows lent-item count and this
+ *    session's lend/return totals.
+ *  - Any key wakes the screen into a MENU (the wake keypress itself is
+ *    swallowed, not acted on) — unless a Timer/Pomodoro/Stopwatch was
+ *    still running, in which case it wakes back into that screen.
+ *  - MENU: Search parts / Lent items / Timer / Pomodoro / Stopwatch /
+ *    Wi-Fi / Clock.
  *  - Countdown timer and Pomodoro (25/5) run in the background; when one
- *    ends the display wakes and a speaker + vibration alarm plays until
- *    any key is pressed.
- *  - Idle -> uptime screen after IDLE_TIMEOUT_MS; OLED switched off after
- *    DISPLAY_OFF_TIMEOUT_MS (any key wakes it). Uptime keeps counting.
- *  - Speaker (tone feedback + alarm) and LDR ambient-light OLED contrast.
+ *    ends, the display wakes and a speaker + vibration alarm plays until
+ *    any key is pressed (30s safety cutoff either way).
+ *  - Idle -> uptime/clock screen after IDLE_TIMEOUT_MS; OLED switched off
+ *    after DISPLAY_OFF_TIMEOUT_MS (any key wakes it; the clock/uptime
+ *    keeps counting underneath).
+ *  - Every keypress gives a short haptic "click" via the vibration motor.
+ *    The speaker/buzzer is reserved for alarms (timer/Pomodoro/RTC alarm
+ *    end) only — it no longer sounds on ordinary confirm/error feedback,
+ *    which stays vibration-only.
  *
  * Known limitation: row "id" values are just the item's current array
  * index. If you have two browser tabs open and delete from one, the
  * other tab's Edit/Delete links can point at the wrong row until it's
  * reloaded. Fine for a single-admin local device; not fixed at this
  * stage.
+ *
+ * ---- Wi-Fi on demand (power-saving follow-up) ----
+ *  - Wi-Fi AP + web server are OFF by default at boot. The "Wi-Fi" menu
+ *    item shows status (SSID/IP when on) and toggles it with '#'.
+ *    The radio (the single biggest power draw on an ESP32) only runs
+ *    while you're actually updating inventory from a browser.
+ *
+ * ---- Optional RTC (power-saving follow-up) ----
+ *  - An RTC (DS3231/DS1307-compatible) is entirely optional and shares
+ *    the OLED's existing I2C bus — no extra wiring beyond the chip
+ *    itself. Detected once at boot; every RTC-dependent feature checks
+ *    that flag first, so a missing or later-disconnected RTC degrades
+ *    to uptime-only instead of crashing.
+ *  - "Clock" menu: view the current time, set it (HHMM), and arm a
+ *    one-shot HH:MM alarm that fires the same beep+vibrate alarm as the
+ *    timer/Pomodoro.
+ *
+ * ---- Removed on request ----
+ *  - The LDR-based auto-brightness feature from the previous revision
+ *    has been taken back out entirely (config, wiring, and code) in the
+ *    interest of simplicity and power.
  *
  * Deliberately NOT implemented yet (see chat reply for full list):
  *  - JSON import/export over the web (Stage 5)
@@ -109,13 +139,13 @@
 #define SOUND_ENABLED       1
 #define SPEAKER_PIN         18
 
-// ---- LDR ambient light -> OLED contrast (ADC1 pin: safe with Wi-Fi on) ----
-#define LDR_ENABLED         1         // set 0 until the LDR is wired
-#define LDR_PIN             34        // input-only ADC1 pin
-#define LDR_DARK_RAW        300       // raw ADC value in a dark room
-#define LDR_BRIGHT_RAW      2500      // raw ADC value in bright light
-#define CONTRAST_MIN        10
-#define CONTRAST_MAX        255
+// ---- Key feedback ----
+#define KEY_CLICK_VIBRATION_MS  15    // tiny haptic tick on every keypress
+
+// ---- Optional RTC (DS3231/DS1307, shares the OLED's I2C bus - no new pins) ----
+#define RTC_I2C_ADDR   0x68
+// If no RTC is wired, detection simply fails and every RTC feature is
+// skipped automatically — the device falls back to uptime-only, no crash.
 
 // ---- Idle / power behaviour ----
 #define IDLE_TIMEOUT_MS         20000UL    // no key -> show uptime screen
@@ -206,7 +236,9 @@ enum AppState {
   STATE_MENU,
   STATE_TIMER,
   STATE_STOPWATCH,
-  STATE_ALARM
+  STATE_ALARM,
+  STATE_WIFI,
+  STATE_CLOCK
 };
 AppState state = STATE_SEARCH;
 
@@ -252,17 +284,29 @@ unsigned long alarmStartMs = 0;
 char alarmMsg[24] = "";
 bool toneOn = false;
 unsigned long toneUntil = 0;
-unsigned long lastLdrMs = 0;
-float ldrFiltered = -1;
-uint8_t currentContrast = 255;
+
+// RTC (optional — everything below stays safely inert if none is found)
+bool rtcPresent = false;
+uint8_t cachedRtcHour = 0, cachedRtcMin = 0, cachedRtcSec = 0;
+unsigned long lastRtcCheckMs = 0;
+bool rtcAlarmEnabled = false;
+uint8_t rtcAlarmHour = 0, rtcAlarmMin = 0;
+uint8_t lastAlarmFiredMinute = 255; // sentinel so a fresh alarm can fire at minute 0
+enum ClockSubMode { CLOCK_VIEW, CLOCK_SET_TIME, CLOCK_SET_ALARM };
+ClockSubMode clockSubMode = CLOCK_VIEW;
+char clockDigits[5] = "";
+uint8_t clockDigitsLen = 0;
 
 // Vibration motor (non-blocking pulse via millis())
 bool vibrating = false;
 unsigned long vibrateUntil = 0;
 
+// Wi-Fi is OFF by default and only started on demand (power saving)
+bool wifiEnabled = false;
+
 // Menu items (index order matches activateMenuItem())
-const char* MENU_ITEMS[] = { "Search parts", "Lent items", "Timer", "Pomodoro 25/5", "Stopwatch" };
-const uint8_t MENU_ITEM_COUNT = 5;
+const char* MENU_ITEMS[] = { "Search parts", "Lent items", "Timer", "Pomodoro 25/5", "Stopwatch", "Wi-Fi", "Clock" };
+const uint8_t MENU_ITEM_COUNT = 7;
 
 // ============================================================
 //  FORWARD DECLARATIONS
@@ -298,7 +342,6 @@ void formatHMS(char* buf, size_t n, uint32_t s);
 void formatMMSS(char* buf, size_t n, uint32_t s);
 void wakeDisplay();
 void updateIdle();
-void updateAmbient();
 void soundInit();
 void startTone(uint16_t freq, uint16_t ms);
 void updateTone();
@@ -320,7 +363,21 @@ void drawTimerScreen();
 void drawStopwatchScreen();
 void drawAlarmScreen();
 
+bool detectRTC();
+uint8_t bcdToDec(uint8_t b);
+uint8_t decToBcd(uint8_t d);
+bool readRtcTime(uint8_t &h, uint8_t &m, uint8_t &s);
+bool writeRtcTime(uint8_t h, uint8_t m, uint8_t s);
+void updateRtcAlarm();
+void formatClock(char* buf, size_t n, uint8_t h, uint8_t m, uint8_t s);
+void handleClockKey(char k);
+void drawClockScreen();
+
 void setupWebServer();
+void startWiFi();
+void stopWiFi();
+void handleWifiKey(char k);
+void drawWifiScreen();
 String htmlHeader(const char* title);
 String htmlFooter();
 bool containsCaseInsensitive(const char* haystack, const char* needle);
@@ -362,12 +419,11 @@ void setup() {
   loadInventory();
   if (!inventoryLoadFailed) reportDuplicates();
 
-  setupWebServer();
-
+  setupWebServer();     // registers HTTP routes only — Wi-Fi stays OFF until requested
   soundInit();
-#if LDR_ENABLED
-  pinMode(LDR_PIN, INPUT);
-#endif
+
+  rtcPresent = detectRTC();
+  Serial.println(rtcPresent ? "RTC detected" : "No RTC detected (uptime-only mode)");
 
   query[0] = 0;
   queryLen = 0;
@@ -382,10 +438,12 @@ void loop() {
   updateTone();
   updateAlarm();
   updateTimer();
-  updateAmbient();
+  updateRtcAlarm();
 
-  dnsServer.processNextRequest(); // non-blocking, returns immediately if idle
-  httpServer.handleClient();      // non-blocking, returns immediately if idle
+  if (wifiEnabled) {
+    dnsServer.processNextRequest(); // non-blocking, returns immediately if idle
+    httpServer.handleClient();      // non-blocking, returns immediately if idle
+  }
 
   if (inventoryLoadFailed) {
     drawNoDataScreen();
@@ -395,6 +453,7 @@ void loop() {
   char k = keypad.getKey();
   if (k != NO_KEY) {
     lastActivityMs = millis();
+    startVibration(KEY_CLICK_VIBRATION_MS); // haptic click on every keypress
     if (alarmActive) {
       dismissAlarm();                       // any key silences the alarm
     } else if (displayOff || state == STATE_IDLE) {
@@ -430,6 +489,8 @@ void loop() {
     case STATE_TIMER:        drawTimerScreen();       break;
     case STATE_STOPWATCH:    drawStopwatchScreen();   break;
     case STATE_ALARM:        drawAlarmScreen();       break;
+    case STATE_WIFI:          drawWifiScreen();         break;
+    case STATE_CLOCK:         drawClockScreen();        break;
   }
 }
 
@@ -699,8 +760,7 @@ int availableOf(const InventoryItem &it) {
 void setError(const char* msg) {
   strlcpy(errorMsg, msg, sizeof(errorMsg));
   errorMsgUntil = millis() + ERROR_MSG_DURATION_MS;
-  startVibration(VIBRATE_ERROR_MS);
-  startTone(300, 180);
+  startVibration(VIBRATE_ERROR_MS); // vibration = routine feedback; buzzer stays reserved for alarms
 }
 
 void startVibration(unsigned long ms) {
@@ -728,6 +788,8 @@ void handleKey(char k) {
     case STATE_MENU:        handleMenuKey(k);          break;
     case STATE_TIMER:       handleTimerKey(k);         break;
     case STATE_STOPWATCH:   handleStopwatchKey(k);     break;
+    case STATE_WIFI:        handleWifiKey(k);          break;
+    case STATE_CLOCK:       handleClockKey(k);          break;
     default: break; // IDLE / ALARM are handled in loop()
   }
 }
@@ -865,8 +927,7 @@ void handleQtyKey(char k, bool isLend) {
       return;
     }
     if (isLend) sessionLendUnits += qv; else sessionReturnUnits += qv;
-    startVibration(VIBRATE_CONFIRM_MS);
-    startTone(1800, 80);
+    startVibration(VIBRATE_CONFIRM_MS); // vibration = routine feedback; buzzer stays reserved for alarms
     state = STATE_ITEM_DETAIL;
   }
 }
@@ -987,8 +1048,8 @@ void drawNoDataScreen() {
 
 // ============================================================
 //  SESSION / IDLE / TOOLS
-//  (uptime idle screen, menu, timer, pomodoro, stopwatch, alarm,
-//   speaker feedback, LDR-based auto contrast)
+//  (uptime/RTC idle screen, menu, timer, pomodoro, stopwatch, alarm,
+//   on-demand Wi-Fi, optional RTC clock/alarm, speaker + key-click vibration)
 // ============================================================
 
 uint32_t uptimeSeconds() {
@@ -1034,28 +1095,6 @@ void updateIdle() {
       u8g2.setPowerSave(1); // OLED driver sleep — uptime keeps counting underneath
     }
   }
-}
-
-// ---- LDR ambient light -> OLED contrast ----
-void updateAmbient() {
-#if LDR_ENABLED
-  unsigned long now = millis();
-  if (now - lastLdrMs < 500) return;
-  lastLdrMs = now;
-
-  int raw = analogRead(LDR_PIN);
-  ldrFiltered = (ldrFiltered < 0) ? raw : (ldrFiltered * 0.8f + raw * 0.2f);
-
-  long v = (long)ldrFiltered;
-  if (v < LDR_DARK_RAW) v = LDR_DARK_RAW;
-  if (v > LDR_BRIGHT_RAW) v = LDR_BRIGHT_RAW;
-  uint8_t contrast = (uint8_t)map(v, LDR_DARK_RAW, LDR_BRIGHT_RAW, CONTRAST_MIN, CONTRAST_MAX);
-
-  if (contrast != currentContrast) {
-    currentContrast = contrast;
-    u8g2.setContrast(currentContrast);
-  }
-#endif
 }
 
 // ---- Speaker (short beeps only; the alarm pattern in updateAlarm()
@@ -1164,6 +1203,149 @@ void updateAlarm() {
   }
 }
 
+// ---- Optional RTC (DS3231/DS1307-compatible) ----
+// Everything here is defensive: if no RTC chip answers on the bus,
+// rtcPresent stays false and every caller already checks that flag,
+// so the rest of the firmware behaves exactly as if this code didn't
+// exist. A wire coming loose mid-session degrades the same way rather
+// than crashing.
+uint8_t bcdToDec(uint8_t b) { return (b / 16) * 10 + (b % 16); }
+uint8_t decToBcd(uint8_t d) { return ((d / 10) << 4) + (d % 10); }
+
+bool detectRTC() {
+  Wire.beginTransmission(RTC_I2C_ADDR);
+  return (Wire.endTransmission() == 0);
+}
+
+bool readRtcTime(uint8_t &h, uint8_t &m, uint8_t &s) {
+  Wire.beginTransmission(RTC_I2C_ADDR);
+  Wire.write((uint8_t)0x00);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom((int)RTC_I2C_ADDR, 3) != 3) return false;
+
+  uint8_t rs = Wire.read();
+  uint8_t rm = Wire.read();
+  uint8_t rh = Wire.read();
+  s = bcdToDec(rs & 0x7F);
+  m = bcdToDec(rm & 0x7F);
+  h = bcdToDec(rh & 0x3F); // strip 12h/PM bits — we always write 24h mode
+  return true;
+}
+
+bool writeRtcTime(uint8_t h, uint8_t m, uint8_t s) {
+  Wire.beginTransmission(RTC_I2C_ADDR);
+  Wire.write((uint8_t)0x00);
+  Wire.write(decToBcd(s));
+  Wire.write(decToBcd(m));
+  Wire.write(decToBcd(h) & 0x3F); // bit6=0 forces 24-hour mode on DS3231
+  return (Wire.endTransmission() == 0);
+}
+
+void formatClock(char* buf, size_t n, uint8_t h, uint8_t m, uint8_t s) {
+  snprintf(buf, n, "%02u:%02u:%02u", h, m, s);
+}
+
+// Throttled to ~1/sec: refreshes the cached time used for display and
+// checks the one-shot HH:MM alarm, without hammering the I2C bus.
+void updateRtcAlarm() {
+  if (!rtcPresent || alarmActive) return;
+  unsigned long now = millis();
+  if (now - lastRtcCheckMs < 900) return;
+  lastRtcCheckMs = now;
+
+  uint8_t h, m, s;
+  if (!readRtcTime(h, m, s)) {
+    rtcPresent = false; // lost comms mid-session — degrade gracefully, don't crash
+    return;
+  }
+  cachedRtcHour = h; cachedRtcMin = m; cachedRtcSec = s;
+
+  if (rtcAlarmEnabled && h == rtcAlarmHour && m == rtcAlarmMin && lastAlarmFiredMinute != m) {
+    lastAlarmFiredMinute = m;
+    rtcAlarmEnabled = false; // one-shot alarm, not a daily recurring one
+    startAlarm("Alarm!");
+  }
+}
+
+void handleClockKey(char k) {
+  if (!rtcPresent) {
+    if (k == '*') state = STATE_MENU; // nothing else to do without an RTC — no crash, just back out
+    return;
+  }
+
+  if (clockSubMode == CLOCK_VIEW) {
+    if (k == 'A') { clockSubMode = CLOCK_SET_TIME; clockDigitsLen = 0; clockDigits[0] = 0; }
+    else if (k == 'B') { clockSubMode = CLOCK_SET_ALARM; clockDigitsLen = 0; clockDigits[0] = 0; }
+    else if (k == 'D') { rtcAlarmEnabled = !rtcAlarmEnabled; if (rtcAlarmEnabled) lastAlarmFiredMinute = 255; }
+    else if (k == '*') { state = STATE_MENU; }
+    return;
+  }
+
+  // CLOCK_SET_TIME / CLOCK_SET_ALARM: enter 4 digits as HHMM
+  if (k >= '0' && k <= '9') {
+    if (clockDigitsLen < 4) { clockDigits[clockDigitsLen++] = k; clockDigits[clockDigitsLen] = 0; }
+  } else if (k == '*') {
+    if (clockDigitsLen > 0) { clockDigitsLen--; clockDigits[clockDigitsLen] = 0; }
+    else clockSubMode = CLOCK_VIEW;
+  } else if (k == '#') {
+    if (clockDigitsLen != 4) { setError("Enter HHMM"); return; }
+    int hh = (clockDigits[0] - '0') * 10 + (clockDigits[1] - '0');
+    int mm = (clockDigits[2] - '0') * 10 + (clockDigits[3] - '0');
+    if (hh > 23 || mm > 59) { setError("Invalid time"); return; }
+
+    if (clockSubMode == CLOCK_SET_TIME) {
+      if (!writeRtcTime((uint8_t)hh, (uint8_t)mm, 0)) { setError("RTC write failed"); return; }
+      startVibration(VIBRATE_CONFIRM_MS);
+    } else { // CLOCK_SET_ALARM
+      rtcAlarmHour = (uint8_t)hh;
+      rtcAlarmMin = (uint8_t)mm;
+      rtcAlarmEnabled = true;
+      lastAlarmFiredMinute = 255;
+      startVibration(VIBRATE_CONFIRM_MS);
+    }
+    clockSubMode = CLOCK_VIEW;
+  }
+}
+
+void drawClockScreen() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 9, "CLOCK");
+  u8g2.drawHLine(0, 11, 128);
+
+  if (!rtcPresent) {
+    u8g2.drawStr(0, 28, "No RTC found");
+    u8g2.drawStr(0, 40, "(uptime-only mode)");
+    u8g2.drawStr(0, 60, "*:Back");
+    u8g2.sendBuffer();
+    return;
+  }
+
+  if (clockSubMode == CLOCK_VIEW) {
+    char t[10];
+    formatClock(t, sizeof(t), cachedRtcHour, cachedRtcMin, cachedRtcSec);
+    u8g2.setFont(u8g2_font_logisoso16_tr);
+    int w = u8g2.getStrWidth(t);
+    u8g2.drawStr((128 - w) / 2, 34, t);
+    u8g2.setFont(u8g2_font_6x10_tf);
+
+    char alarmLine[24];
+    if (rtcAlarmEnabled) snprintf(alarmLine, sizeof(alarmLine), "Alarm %02u:%02u ON", rtcAlarmHour, rtcAlarmMin);
+    else snprintf(alarmLine, sizeof(alarmLine), "Alarm: OFF");
+    u8g2.drawStr(0, 48, alarmLine);
+
+    if (errorMsg[0] && millis() < errorMsgUntil) u8g2.drawStr(0, 60, errorMsg);
+    else u8g2.drawStr(0, 60, "A:SetTime B:Alarm D:Tgl");
+  } else {
+    u8g2.drawStr(0, 24, clockSubMode == CLOCK_SET_TIME ? "Set time (HHMM)" : "Set alarm (HHMM)");
+    char line[20]; snprintf(line, sizeof(line), "HHMM: %s", clockDigits);
+    u8g2.drawStr(0, 40, line);
+    if (errorMsg[0] && millis() < errorMsgUntil) u8g2.drawStr(0, 60, errorMsg);
+    else u8g2.drawStr(0, 60, "#:OK *:Del/Back");
+  }
+  u8g2.sendBuffer();
+}
+
 // ---- Menu ----
 void adjustMenuScroll() {
   if (menuSel < menuScroll) menuScroll = menuSel;
@@ -1195,6 +1377,15 @@ void activateMenuItem(uint8_t idx) {
       swRunning = false;
       swAccumMs = 0;
       state = STATE_STOPWATCH;
+      break;
+    case 5: // Wi-Fi
+      state = STATE_WIFI;
+      break;
+    case 6: // Clock
+      clockSubMode = CLOCK_VIEW;
+      clockDigitsLen = 0;
+      clockDigits[0] = 0;
+      state = STATE_CLOCK;
       break;
     default: break;
   }
@@ -1266,21 +1457,27 @@ void drawIdleScreen() {
   u8g2.drawStr(0, 9, "Inventory Terminal");
   u8g2.drawHLine(0, 11, 128);
 
-  char up[16];
-  formatHMS(up, sizeof(up), uptimeSeconds());
+  // Show the real wall-clock time if an RTC answered at boot; otherwise
+  // fall back to elapsed session uptime. Either way this never crashes —
+  // it just picks whichever source of truth is actually available.
+  u8g2.drawStr(0, 20, rtcPresent ? "Time" : "Uptime");
+  char big[16];
+  if (rtcPresent) formatClock(big, sizeof(big), cachedRtcHour, cachedRtcMin, cachedRtcSec);
+  else            formatHMS(big, sizeof(big), uptimeSeconds());
   u8g2.setFont(u8g2_font_logisoso16_tr);
-  int w = u8g2.getStrWidth(up);
-  u8g2.drawStr((128 - w) / 2, 36, up);
+  int w = u8g2.getStrWidth(big);
+  u8g2.drawStr((128 - w) / 2, 40, big);
   u8g2.setFont(u8g2_font_6x10_tf);
 
   uint16_t lentCount = 0;
   for (uint16_t i = 0; i < itemCount; i++) if (items[i].lent > 0) lentCount++;
 
   char line1[24]; snprintf(line1, sizeof(line1), "Lent items: %u", lentCount);
-  char line2[24]; snprintf(line2, sizeof(line2), "Sess L:%lu R:%lu",
-                            (unsigned long)sessionLendUnits, (unsigned long)sessionReturnUnits);
-  u8g2.drawStr(0, 50, line1);
-  u8g2.drawStr(0, 62, line2);
+  char line2[24]; snprintf(line2, sizeof(line2), "L:%lu R:%lu WiFi:%s",
+                            (unsigned long)sessionLendUnits, (unsigned long)sessionReturnUnits,
+                            wifiEnabled ? "ON" : "OFF");
+  u8g2.drawStr(0, 52, line1);
+  u8g2.drawStr(0, 63, line2);
   u8g2.sendBuffer();
 }
 
@@ -1383,18 +1580,9 @@ void appendEscaped(char* dest, size_t destSize, const char* src) {
 }
 
 void setupWebServer() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-  IPAddress apIP = WiFi.softAPIP();
-
-  Serial.print("AP SSID: ");
-  Serial.println(AP_SSID);
-  Serial.print("AP IP:   ");
-  Serial.println(apIP);
-
-  // Captive-portal DNS foundation: resolve every hostname to our own IP.
-  dnsServer.start(DNS_PORT, "*", apIP);
-
+  // Registers routes once at boot. Does NOT start the radio or the
+  // listener — that only happens on demand via startWiFi(), so the
+  // Wi-Fi hardware draws no power until you actually ask for it.
   httpServer.on("/", HTTP_GET, handleWebRoot);
   httpServer.on("/inventory", HTTP_GET, handleWebInventory);
   httpServer.on("/add", HTTP_GET, handleWebAddForm);
@@ -1404,9 +1592,57 @@ void setupWebServer() {
   httpServer.on("/delete", HTTP_GET, handleWebDeleteConfirm);
   httpServer.on("/delete", HTTP_POST, handleWebDeleteSubmit);
   httpServer.onNotFound(handleWebNotFound);
-  httpServer.begin();
+}
 
-  Serial.println("Web server started");
+void startWiFi() {
+  if (wifiEnabled) return;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  IPAddress apIP = WiFi.softAPIP();
+  dnsServer.start(DNS_PORT, "*", apIP);
+  httpServer.begin();
+  wifiEnabled = true;
+  Serial.print("Wi-Fi AP started, IP: ");
+  Serial.println(apIP);
+}
+
+void stopWiFi() {
+  if (!wifiEnabled) return;
+  httpServer.stop();
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  wifiEnabled = false;
+  Serial.println("Wi-Fi AP stopped (power saving)");
+}
+
+void handleWifiKey(char k) {
+  if (k == '#') {
+    if (wifiEnabled) stopWiFi(); else startWiFi();
+  } else if (k == '*') {
+    state = STATE_MENU;
+  }
+}
+
+void drawWifiScreen() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 9, "WI-FI");
+  u8g2.drawHLine(0, 11, 128);
+
+  if (wifiEnabled) {
+    u8g2.drawStr(0, 26, "Status: ON");
+    char line[24];
+    snprintf(line, sizeof(line), "SSID: %s", AP_SSID);
+    u8g2.drawStr(0, 38, line);
+    snprintf(line, sizeof(line), "IP: %s", WiFi.softAPIP().toString().c_str());
+    u8g2.drawStr(0, 50, line);
+  } else {
+    u8g2.drawStr(0, 30, "Status: OFF");
+    u8g2.drawStr(0, 42, "(saving power)");
+  }
+  u8g2.drawStr(0, 62, "#:Toggle *:Back");
+  u8g2.sendBuffer();
 }
 
 String htmlHeader(const char* title) {
