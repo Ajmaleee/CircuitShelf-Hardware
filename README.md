@@ -8,10 +8,4 @@ this specific build has a lot of feature some of which are a timer and a time co
 
 ![Image 1](./IMG_20260930_161512.jpg)
 
-![Image 2](./image2.jpg)
 
-![Image 3](./image3.jpg)
-
-![Image 4](./image4.jpg)
-
-![Image 5](./image5.jpg)
