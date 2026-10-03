@@ -6,3 +6,4 @@ Next, we have the most important part, of course: the keypad module. This is a 4
 
 this specific build has a lot of feature some of which are a timer and a time counter inventory surgery stopwatch Wi-Fi access to update the modules a clock using the RTC settings tab and inventory tracker where I can drag that in and modules I have returned 
 
+![image](image.png)](URL-of-your-working-model)
