@@ -1,90 +1,152 @@
 /*
  * ESP32 Electronics Inventory Terminal
- * STAGE 4 + session tools — Full web inventory management,
- * plus uptime/idle screen, menu, timer, Pomodoro, stopwatch, alarm
+ * STAGE 6 (Increment 2 of several — see note below) — OLED UI redesign,
+ * building on Increment 1's 3x3 icon-grid launcher + watch-style idle
+ * clock. Nothing below the UI layer was touched in either increment.
+ *
+ * ---- Stage 6, Increment 2 (this revision) ----
+ *  - SEARCH: redesigned as a compact terminal-style screen — "SEARCH"
+ *    title, "> query_" prompt line, up to 3 result rows with the
+ *    available quantity right-aligned, fixed "A/B browse #:select"
+ *    hint. A and B now browse results too, alongside the original C/D
+ *    (both work — nothing old was removed). Search also now expands
+ *    through a small alias table grounded in this device's real
+ *    inventory (e.g. typing OLED also matches "SH1106", GPS also
+ *    matches "Neo 6M GPS module") without touching the stored data.
+ *  - TIMER vs POMODORO now have distinct screens. Both show a graphical
+ *    progress bar (drawProgressBar, shared). Pomodoro additionally
+ *    shows "FOCUS n/N" or "BREAK n/N" and now actually cycles through
+ *    POMO_CYCLES_PER_SESSION focus/break pairs automatically (classic
+ *    Pomodoro = 4), rather than stopping after one.
+ *  - ALARM screen (drawAlarmAnimation) now does a non-blocking full-
+ *    screen invert pulse (~250ms) for as long as the buzzer melody
+ *    plays, instead of static text.
+ *  - Lightest "event" tier: a brief single invert-flash (100-120ms) on
+ *    a successful lend/return and on any validation error, shown on
+ *    the item-detail and quantity screens — reuses the same XOR-invert
+ *    technique as the alarm, just a single pulse instead of a loop.
+ *  - RTC moved AGAIN, this time to GPIO19 (SDA) / GPIO23 (SCL) — the
+ *    previous 16/17 aren't broken out on this particular board (common
+ *    on WROVER-style modules, where 16/17 are used internally for
+ *    PSRAM). 19/23 are standard, non-strapping, unused elsewhere.
  *
  * Target: Arduino IDE, ESP32 Arduino Core 3.x, ESP32 DevKit V1
  * NOT using PlatformIO.
  *
- * Carried over from Stage 1-3: physical keypad/OLED terminal (search,
- * lend/return, vibration feedback) and the Wi-Fi AP + captive portal
- * foundation, all unchanged.
+ * ---- Stage 6, Increment 1 (this revision) ----
+ *  - HOME LAUNCHER: the old scrolling text menu is replaced by a 3x3
+ *    grid of vector-drawn monochrome icons (Timer, Pomodoro, Stopwatch,
+ *    Search, Wi-Fi, Clock, Inventory, Settings, More), navigated with
+ *    A=left, B=right, C=up, D=down, #=select, *=sleep. The selected
+ *    icon gets an animated corner-bracket focus indicator (non-blocking,
+ *    ~150ms cycle) and its name is shown centered beneath the grid.
+ *    `STATE_MENU` was renamed `STATE_HOME` throughout; every screen that
+ *    returns to "the menu" (alarm dismiss, wake-from-idle, the back key
+ *    cancels) now returns to this grid, unchanged in behavior.
+ *  - IDLE CLOCK: redesigned as a minimal digital-watch screen — one big
+ *    time, nothing else. When an RTC is present it now also shows the
+ *    date (DD MON YYYY) beneath the time, reading date/month/year from
+ *    the RTC for the first time (previously only time was read). Falls
+ *    back to plain uptime with no date line if no RTC is present, same
+ *    as before.
+ *  - New Settings and More screens fill out the 3x3 grid honestly:
+ *    Settings shows read-only device info (idle timeout, RTC/Wi-Fi
+ *    status); More is a clearly-labeled "coming soon" placeholder,
+ *    rather than pretending either is more functional than it is.
+ *  - Nothing else changed: search, lend/return, timers, Pomodoro,
+ *    stopwatch, Wi-Fi, web management, import/export, and all storage
+ *    logic are untouched and still work exactly as before.
  *
- * New in Stage 4 — the web interface is no longer read-only:
- *  - "/inventory" now includes a search box (substring, case-insensitive,
- *    server-side — separate from and non-interfering with the physical
- *    terminal's own prefix search) plus Edit/Delete links per row.
- *  - "/add" (GET form, POST submit) — add a new item. Name and quantity
- *    are required; status must be one of working/faulty/untested;
- *    new items always start with lent = 0. Validated on the ESP32.
- *  - "/edit?id=N" (GET form, POST submit) — change name/location/qty/
- *    status. Quantity can never be set below the amount already lent.
- *  - "/delete?id=N" (GET confirmation, POST to actually delete) — asks
- *    for confirmation and shows a warning if anything is currently lent.
- *  - All writes reuse the Stage 2 safe-save path (temp file, verify,
- *    backup rotation, atomic rename) and roll back in RAM if the save
- *    fails, exactly like a physical lend/return.
- *  - Any web-triggered add/edit/delete returns the physical terminal to
- *    the search screen and recomputes results, since array indices can
- *    shift (in particular after a delete) — this avoids the keypad UI
- *    ever pointing at a stale or wrong record.
- *  - No frameworks, no CDN, no external assets — plain HTML/CSS only,
- *    all generated on-device.
+ * Still deliberately NOT done (everything from Increment 1's list is now
+ * complete; what's left):
+ *  - A real Settings screen with editable values (currently view-only).
+ *  - RTC date-setting from the UI (time can be set via Clock; date
+ *    registers are read but not yet writable from the device).
+ *  - Further "navigation" tier polish called for in section 7 of the
+ *    doc (e.g. a brief slide/fade when *entering* a feature screen from
+ *    the grid) — the grid's own focus animation and the event-level
+ *    flashes are done; screen-to-screen transition animation is not.
  *
- * ---- Session tools (extra step requested between Stage 4 and 5) ----
- *  - Boot -> IDLE screen: shows the real time-of-day if an RTC is
- *    detected, otherwise falls back to session UPTIME — automatically,
- *    with no crash either way. Also shows lent-item count and this
- *    session's lend/return totals.
- *  - Any key wakes the screen into a MENU (the wake keypress itself is
- *    swallowed, not acted on) — unless a Timer/Pomodoro/Stopwatch was
- *    still running, in which case it wakes back into that screen.
- *  - MENU: Search parts / Lent items / Timer / Pomodoro / Stopwatch /
- *    Wi-Fi / Clock.
- *  - Countdown timer and Pomodoro (25/5) run in the background; when one
- *    ends, the display wakes and a speaker + vibration alarm plays until
- *    any key is pressed (30s safety cutoff either way).
- *  - Idle -> uptime/clock screen after IDLE_TIMEOUT_MS; OLED switched off
- *    after DISPLAY_OFF_TIMEOUT_MS (any key wakes it; the clock/uptime
- *    keeps counting underneath).
- *  - Every keypress gives a short haptic "click" via the vibration motor.
- *    The speaker/buzzer is reserved for alarms (timer/Pomodoro/RTC alarm
- *    end) only — it no longer sounds on ordinary confirm/error feedback,
- *    which stays vibration-only.
+ * ---- Stage 1-2: physical terminal + robust storage ----
+ * Keypad/OLED search (Nokia multi-tap), lend/return, safe LittleFS
+ * writes (temp file -> verify -> backup rotate -> atomic rename),
+ * corruption recovery, field validation, vibration feedback.
  *
- * Known limitation: row "id" values are just the item's current array
- * index. If you have two browser tabs open and delete from one, the
- * other tab's Edit/Delete links can point at the wrong row until it's
- * reloaded. Fine for a single-admin local device; not fixed at this
- * stage.
+ * ---- Stage 3-4: Wi-Fi + full web management ----
+ * On-demand Wi-Fi AP (OFF by default — see "Wi-Fi on demand" below) with
+ * a built-in WebServer, no external web libraries. "/inventory" has
+ * search, Add/Edit/Delete, all validated server-side and sharing the
+ * same LittleFS inventory as the keypad. Any web-triggered change
+ * returns the physical terminal to its search screen and recomputes
+ * results, since array indices can shift after a delete.
  *
- * ---- Wi-Fi on demand (power-saving follow-up) ----
- *  - Wi-Fi AP + web server are OFF by default at boot. The "Wi-Fi" menu
- *    item shows status (SSID/IP when on) and toggles it with '#'.
- *    The radio (the single biggest power draw on an ESP32) only runs
- *    while you're actually updating inventory from a browser.
+ * ---- Session tools: menu, idle screen, timer/Pomodoro/stopwatch ----
+ * Any key wakes the screen into a MENU (Search / Lent items / Timer /
+ * Pomodoro / Stopwatch / Wi-Fi / Clock); the wake keypress itself is
+ * swallowed. A running Timer/Pomodoro/Stopwatch is woken back into its
+ * own screen rather than the menu. Idle after IDLE_TIMEOUT_MS shows a
+ * PURE time display — just the big number, nothing else — using the
+ * real time-of-day if an RTC is present, otherwise session uptime.
+ * OLED fully switches off after DISPLAY_OFF_TIMEOUT_MS (any key wakes
+ * it; the clock/uptime keeps counting underneath). Every keypress gives
+ * a short haptic click via the vibration motor; the speaker is reserved
+ * for alarms only. Alarms play a short repeating original jingle (not a
+ * reproduction of any existing song) rather than a flat beep.
  *
- * ---- Optional RTC (power-saving follow-up) ----
- *  - An RTC (DS3231/DS1307-compatible) is entirely optional and shares
- *    the OLED's existing I2C bus — no extra wiring beyond the chip
- *    itself. Detected once at boot; every RTC-dependent feature checks
- *    that flag first, so a missing or later-disconnected RTC degrades
- *    to uptime-only instead of crashing.
- *  - "Clock" menu: view the current time, set it (HHMM), and arm a
- *    one-shot HH:MM alarm that fires the same beep+vibrate alarm as the
- *    timer/Pomodoro.
+ * ---- Optional RTC, on its OWN dedicated I2C bus ----
+ * A DS3231/DS1307-compatible RTC is entirely optional and now lives on
+ * a second hardware I2C bus (RTC_SDA_PIN/RTC_SCL_PIN), separate from the
+ * OLED's bus — this was changed specifically to rule out bus sharing as
+ * a cause of detection trouble. If nothing answers at boot, a one-time
+ * I2C scan is logged to Serial to help diagnose wiring, and every
+ * RTC-dependent feature simply stays off — no crash, then or if it
+ * drops out mid-session. "Clock" menu: view/set the time (HHMM) and arm
+ * a one-shot HH:MM alarm.
  *
- * ---- Removed on request ----
- *  - The LDR-based auto-brightness feature from the previous revision
- *    has been taken back out entirely (config, wiring, and code) in the
- *    interest of simplicity and power.
+ * ---- Wi-Fi on demand (power saving) ----
+ * Wi-Fi AP + web server are OFF by default at boot. The "Wi-Fi" menu
+ * item shows status (SSID/IP when on) and toggles it with '#' — the
+ * radio, the single biggest power draw on an ESP32, only runs while
+ * you're actually updating inventory from a browser.
  *
- * Deliberately NOT implemented yet (see chat reply for full list):
- *  - JSON import/export over the web (Stage 5)
- *  - True deep-sleep / light-sleep (this only dims/blanks the OLED and
- *    idles the loop a little — the ESP32 core, Wi-Fi AP and web server
- *    stay fully powered throughout; real sleep is deferred to Stage 5)
- *  - Flipper-Zero-style animated/graphical UI polish (Stage 5)
+ * ---- New in Stage 5 ----
+ *  - "/import" (GET form, POST file upload): replaces the current
+ *    inventory with an uploaded JSON file. Streamed straight to a temp
+ *    file (never buffered whole in RAM), capped at MAX_IMPORT_BYTES,
+ *    parsed into a scratch buffer and validated exactly like boot-time
+ *    loading (bad records skipped/clamped, counts reported back) before
+ *    anything live is touched. Quantities currently lent out on THIS
+ *    device are carried over automatically for any item that still
+ *    matches by name+location — the device, not a possibly-stale
+ *    exported file, is the source of truth for what's checked out right
+ *    now. Commits through the same safe-save path as everything else,
+ *    and rolls back to whatever's genuinely on flash if the save fails.
+ *  - "/export": downloads the current inventory as JSON, in exactly the
+ *    format "/import" expects back.
+ *  - "/restore": confirm-then-restore the inventory from the Stage 2
+ *    .bak file — an explicit undo for a bad import or edit.
+ *  - Captive portal response improved: unknown paths now get a tiny
+ *    HTML page with both a meta-refresh and a manual link alongside the
+ *    redirect, since a bare Location header isn't reliably auto-followed
+ *    by every OS's captive-portal detector.
+ *  - Stopwatch now shows milliseconds (MM:SS.mmm).
+ *
+ * ---- Removed / changed on request ----
+ *  - The LDR-based auto-brightness feature has been fully removed
+ *    (config, wiring, code) for simplicity and power.
+ *  - Idle timeout raised from 20s to 30s.
+ *
+ * Known limitation: web row "id" values are just the item's current
+ * array index. Two browser tabs open at once, with a delete happening
+ * in one, can leave the other tab's Edit/Delete links pointing at the
+ * wrong row until it's reloaded. Fine for a single-admin local device.
+ *
+ * Still NOT implemented (by design, not oversight):
+ *  - True deep-sleep / light-sleep. Idle/display-off only dims or blanks
+ *    the OLED and idles the loop slightly — the ESP32 core and (when
+ *    enabled) Wi-Fi stay fully powered. Real sleep would mean dropping
+ *    Wi-Fi/the web server entirely while asleep, which is a bigger
+ *    architectural change best done as its own deliberate step.
  */
 
 #include <Wire.h>
@@ -122,7 +184,7 @@
 #define QUERY_MAX_LEN      24
 #define QTY_BUF_LEN          6
 
-#define VISIBLE_RESULT_LINES 4
+#define VISIBLE_RESULT_LINES 3   // search's new terminal layout fits 3 result rows cleanly
 
 // ---- Vibration motor (coin-cell ERM motor via transistor driver) ----
 #define VIBRATION_MOTOR_PIN 4
@@ -134,6 +196,8 @@
 #define AP_PASSWORD   "inventory123"   // WPA2 needs 8+ chars; use "" for an open network
 #define DNS_PORT      53
 #define HTTP_PORT     80
+#define MAX_IMPORT_BYTES  65536UL      // reject oversized JSON uploads outright
+#define IMPORT_TMP_FILE   "/import.tmp"
 
 // ---- Speaker (passive speaker/buzzer via NPN transistor, like the motor) ----
 #define SOUND_ENABLED       1
@@ -142,18 +206,25 @@
 // ---- Key feedback ----
 #define KEY_CLICK_VIBRATION_MS  15    // tiny haptic tick on every keypress
 
-// ---- Optional RTC (DS3231/DS1307, shares the OLED's I2C bus - no new pins) ----
+// ---- Optional RTC (DS3231/DS1307) on its OWN dedicated I2C bus ----
+// Given on a shared bus with the OLED, use separate pins instead — rules
+// out bus contention / pull-up / address conflicts as a cause of a
+// non-detected RTC, and makes wiring/debugging simpler.
 #define RTC_I2C_ADDR   0x68
-// If no RTC is wired, detection simply fails and every RTC feature is
-// skipped automatically — the device falls back to uptime-only, no crash.
+#define RTC_SDA_PIN    19   // was 16 — not broken out on some ESP32 modules (e.g. WROVER, used for PSRAM)
+#define RTC_SCL_PIN    23   // was 17, same reason — 19/23 are free, standard, non-strapping pins
+// If no RTC is wired (or it doesn't answer), detection simply fails and
+// every RTC feature is skipped automatically — falls back to uptime-only,
+// no crash.
 
 // ---- Idle / power behaviour ----
-#define IDLE_TIMEOUT_MS         20000UL    // no key -> show uptime screen
+#define IDLE_TIMEOUT_MS         30000UL    // no key -> pure uptime/clock screen
 #define DISPLAY_OFF_TIMEOUT_MS  300000UL   // idle this long -> OLED off (0 = never)
 
 // ---- Timer / Pomodoro / alarm ----
 #define POMO_WORK_MIN       25
 #define POMO_BREAK_MIN      5
+#define POMO_CYCLES_PER_SESSION 4   // classic Pomodoro: 4 focus blocks per session
 #define ALARM_MAX_MS        30000UL
 
 // ---- Storage ----
@@ -174,6 +245,7 @@ U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 // ============================================================
 WebServer httpServer(HTTP_PORT);
 DNSServer dnsServer;
+TwoWire RTCWire = TwoWire(1); // dedicated second I2C bus, separate from the OLED's Wire
 
 // ============================================================
 //  KEYPAD
@@ -233,12 +305,14 @@ enum AppState {
   STATE_LEND_QTY,
   STATE_RETURN_QTY,
   STATE_IDLE,
-  STATE_MENU,
+  STATE_HOME,
   STATE_TIMER,
   STATE_STOPWATCH,
   STATE_ALARM,
   STATE_WIFI,
-  STATE_CLOCK
+  STATE_CLOCK,
+  STATE_SETTINGS,
+  STATE_MORE
 };
 AppState state = STATE_SEARCH;
 
@@ -265,6 +339,10 @@ uint8_t qtyLen = 0;
 char errorMsg[24] = "";
 unsigned long errorMsgUntil = 0;
 
+// Brief invert-flash overlay for "event" level feedback (confirm/error),
+// drawn by whichever screen is active when triggered. See triggerFlash().
+unsigned long flashUntil = 0;
+
 // Session / idle / tools
 enum TimerKind { TIMER_NONE, TIMER_COUNTDOWN, TIMER_POMO_WORK, TIMER_POMO_BREAK };
 unsigned long lastActivityMs = 0;
@@ -277,17 +355,20 @@ unsigned long timerStartMs = 0, timerDurationMs = 0;
 char timerInput[4] = "";
 uint8_t timerInputLen = 0;
 bool pendingBreak = false;             // Pomodoro: start break after alarm dismissed
+bool pendingNextFocus = false;         // Pomodoro: start the next focus block after a break ends
+uint8_t pomoCycleIndex = 0;            // 1-based current focus cycle within the session (0 = none active)
 bool swRunning = false;
 unsigned long swStartMs = 0, swAccumMs = 0;
 bool alarmActive = false;
 unsigned long alarmStartMs = 0;
 char alarmMsg[24] = "";
-bool toneOn = false;
-unsigned long toneUntil = 0;
+uint8_t alarmNoteIdx = 0;
+unsigned long alarmNoteStartMs = 0;
 
 // RTC (optional — everything below stays safely inert if none is found)
 bool rtcPresent = false;
 uint8_t cachedRtcHour = 0, cachedRtcMin = 0, cachedRtcSec = 0;
+uint8_t cachedRtcDate = 0, cachedRtcMonth = 0, cachedRtcYear = 0;
 unsigned long lastRtcCheckMs = 0;
 bool rtcAlarmEnabled = false;
 uint8_t rtcAlarmHour = 0, rtcAlarmMin = 0;
@@ -304,16 +385,27 @@ unsigned long vibrateUntil = 0;
 // Wi-Fi is OFF by default and only started on demand (power saving)
 bool wifiEnabled = false;
 
-// Menu items (index order matches activateMenuItem())
-const char* MENU_ITEMS[] = { "Search parts", "Lent items", "Timer", "Pomodoro 25/5", "Stopwatch", "Wi-Fi", "Clock" };
-const uint8_t MENU_ITEM_COUNT = 7;
+// Web import (file upload) state
+bool importInProgress = false;
+size_t importBytes = 0;
+char importErr[64] = "";
+File importFile;
+
+// Home launcher grid (3x3, row-major). Index order matches both
+// HOME_ICONS[] and activateHomeItem()'s switch.
+const char* HOME_ITEMS[] = {
+  "Timer", "Pomodoro", "Stopwatch",
+  "Search", "Wi-Fi", "Clock",
+  "Inventory", "Settings", "More"
+};
+const uint8_t HOME_ITEM_COUNT = 9;
 
 // ============================================================
 //  FORWARD DECLARATIONS
 // ============================================================
 bool loadInventory();
 bool tryLoadFrom(const char* path);
-bool parseInventoryFromFile(File &f, uint16_t &outCount);
+bool parseInventoryFromFile(File &f, InventoryItem* target, uint16_t &outCount, uint16_t &skippedOut, uint16_t &clampedOut);
 bool isValidStatus(const char* s);
 void reportDuplicates();
 
@@ -324,6 +416,7 @@ bool validateJsonFile(const char* path, uint16_t expectedCount);
 void runSearch();
 void adjustScroll();
 void setError(const char* msg);
+void triggerFlash(unsigned long ms);
 int availableOf(const InventoryItem &it);
 void startVibration(unsigned long ms);
 void updateVibration();
@@ -340,6 +433,7 @@ void drawNoDataScreen();
 uint32_t uptimeSeconds();
 void formatHMS(char* buf, size_t n, uint32_t s);
 void formatMMSS(char* buf, size_t n, uint32_t s);
+void formatMMSSms(char* buf, size_t n, unsigned long totalMs);
 void wakeDisplay();
 void updateIdle();
 void soundInit();
@@ -352,24 +446,46 @@ void startAlarm(const char* msg);
 void stopAlarm();
 void dismissAlarm();
 void updateAlarm();
-void activateMenuItem(uint8_t idx);
-void handleMenuKey(char k);
+void activateHomeItem(uint8_t idx);
+void handleHomeKey(char k);
 void handleTimerKey(char k);
 void handleStopwatchKey(char k);
-void drawIdleScreen();
+void handleSettingsKey(char k);
+void handleMoreKey(char k);
+void drawIdleClock();
 void adjustMenuScroll();
-void drawMenuScreen();
+void drawSelectionAnimation(int cx, int cy);
+void drawHomeGrid();
+void drawProgressBar(int x, int y, int w, int h, float fraction);
 void drawTimerScreen();
+void drawPomodoroScreen();
 void drawStopwatchScreen();
-void drawAlarmScreen();
+void drawAlarmAnimation();
+void drawSettingsScreen();
+void drawMoreScreen();
+
+// Simple vector-drawn monochrome icons, one per home-grid slot (same
+// order as HOME_ITEMS[]/HOME_ICONS[]).
+void iconTimer(int cx, int cy);
+void iconPomodoro(int cx, int cy);
+void iconStopwatch(int cx, int cy);
+void iconSearch(int cx, int cy);
+void iconWifi(int cx, int cy);
+void iconClock(int cx, int cy);
+void iconInventory(int cx, int cy);
+void iconSettings(int cx, int cy);
+void iconMore(int cx, int cy);
 
 bool detectRTC();
+void scanRtcBus();
 uint8_t bcdToDec(uint8_t b);
 uint8_t decToBcd(uint8_t d);
 bool readRtcTime(uint8_t &h, uint8_t &m, uint8_t &s);
+bool readRtcFull(uint8_t &h, uint8_t &m, uint8_t &s, uint8_t &date, uint8_t &month, uint8_t &year);
 bool writeRtcTime(uint8_t h, uint8_t m, uint8_t s);
 void updateRtcAlarm();
 void formatClock(char* buf, size_t n, uint8_t h, uint8_t m, uint8_t s);
+void formatRtcDate(char* buf, size_t n, uint8_t date, uint8_t month, uint8_t year);
 void handleClockKey(char k);
 void drawClockScreen();
 
@@ -395,6 +511,14 @@ void handleWebDeleteConfirm();
 void handleWebDeleteSubmit();
 void handleWebNotFound();
 void appendEscaped(char* dest, size_t destSize, const char* src);
+void appendJsonEscaped(char* dest, size_t destSize, const char* src);
+bool importInventoryFile(const char* path, uint16_t &resultCount, uint16_t &skippedOut, uint16_t &clampedOut, char* errOut, size_t errOutSize);
+void handleImportForm();
+void handleImportUpload();
+void handleImportSubmit();
+void handleExport();
+void handleRestoreBackup();
+void handleRestoreSubmit();
 
 // ============================================================
 //  SETUP / LOOP
@@ -422,8 +546,10 @@ void setup() {
   setupWebServer();     // registers HTTP routes only — Wi-Fi stays OFF until requested
   soundInit();
 
+  RTCWire.begin(RTC_SDA_PIN, RTC_SCL_PIN); // RTC gets its own bus, separate from the OLED
   rtcPresent = detectRTC();
   Serial.println(rtcPresent ? "RTC detected" : "No RTC detected (uptime-only mode)");
+  if (!rtcPresent) scanRtcBus(); // help diagnose wiring if it's supposed to be there
 
   query[0] = 0;
   queryLen = 0;
@@ -463,7 +589,7 @@ void loop() {
       } else if (swRunning) {
         state = STATE_STOPWATCH;            // stopwatch kept counting underneath
       } else {
-        state = STATE_MENU;
+        state = STATE_HOME;
         menuSel = 0;
         menuScroll = 0;
       }
@@ -484,13 +610,18 @@ void loop() {
     case STATE_ITEM_DETAIL:  drawItemDetail();        break;
     case STATE_LEND_QTY:     drawQtyScreen(true);     break;
     case STATE_RETURN_QTY:   drawQtyScreen(false);    break;
-    case STATE_IDLE:         drawIdleScreen();        break;
-    case STATE_MENU:         drawMenuScreen();        break;
-    case STATE_TIMER:        drawTimerScreen();       break;
+    case STATE_IDLE:         drawIdleClock();         break;
+    case STATE_HOME:         drawHomeGrid();          break;
+    case STATE_TIMER:
+      if (timerKind == TIMER_POMO_WORK || timerKind == TIMER_POMO_BREAK) drawPomodoroScreen();
+      else drawTimerScreen();
+      break;
     case STATE_STOPWATCH:    drawStopwatchScreen();   break;
-    case STATE_ALARM:        drawAlarmScreen();       break;
-    case STATE_WIFI:          drawWifiScreen();         break;
-    case STATE_CLOCK:         drawClockScreen();        break;
+    case STATE_ALARM:        drawAlarmAnimation();    break;
+    case STATE_WIFI:         drawWifiScreen();        break;
+    case STATE_CLOCK:        drawClockScreen();       break;
+    case STATE_SETTINGS:     drawSettingsScreen();    break;
+    case STATE_MORE:         drawMoreScreen();        break;
   }
 }
 
@@ -506,11 +637,16 @@ bool isValidStatus(const char* s) {
   return false;
 }
 
-// Parses a JSON array of inventory records from an open file directly
-// into the global items[] array, validating/clamping each field.
-// Does not close the file. Returns false only on structural JSON errors
-// (not on individual bad records — those are skipped/clamped instead).
-bool parseInventoryFromFile(File &f, uint16_t &outCount) {
+// Parses a JSON array of inventory records from an open file into
+// `target` (any InventoryItem buffer of at least MAX_RECORDS capacity —
+// boot/reload pass the global items[], import passes a scratch buffer
+// so the live inventory isn't touched until the caller is ready to
+// commit). Does not close the file. Returns false only on structural
+// JSON errors; individual bad records are skipped/clamped instead, and
+// those counts are reported back via skippedOut/clampedOut so a caller
+// (e.g. the web import page) can show them to the user.
+bool parseInventoryFromFile(File &f, InventoryItem* target, uint16_t &outCount,
+                             uint16_t &skippedOut, uint16_t &clampedOut) {
   JsonDocument doc; // ArduinoJson v7 — heap-allocated, sized automatically
   DeserializationError err = deserializeJson(doc, f);
   if (err) {
@@ -525,8 +661,8 @@ bool parseInventoryFromFile(File &f, uint16_t &outCount) {
 
   JsonArray arr = doc.as<JsonArray>();
   outCount = 0;
-  uint16_t skippedEmpty = 0;
-  uint16_t clampedFields = 0;
+  skippedOut = 0;
+  clampedOut = 0;
 
   for (JsonObject obj : arr) {
     if (outCount >= MAX_RECORDS) {
@@ -536,7 +672,7 @@ bool parseInventoryFromFile(File &f, uint16_t &outCount) {
 
     const char* nameVal = obj["name"] | "";
     if (strlen(nameVal) == 0) {
-      skippedEmpty++;
+      skippedOut++;
       continue; // refuse nameless records — nothing useful to search/show
     }
 
@@ -549,23 +685,23 @@ bool parseInventoryFromFile(File &f, uint16_t &outCount) {
       strlcpy(tmp.status, statusVal, STATUS_MAX_LEN);
     } else {
       strlcpy(tmp.status, "working", STATUS_MAX_LEN);
-      clampedFields++;
+      clampedOut++;
     }
 
     long q = obj["qty"]  | 0;
     long l = obj["lent"] | 0;
-    if (q < 0) { q = 0; clampedFields++; }
-    if (l < 0) { l = 0; clampedFields++; }
-    if (l > q) { l = q; clampedFields++; } // corrupted lent > qty is impossible, clamp it
+    if (q < 0) { q = 0; clampedOut++; }
+    if (l < 0) { l = 0; clampedOut++; }
+    if (l > q) { l = q; clampedOut++; } // corrupted lent > qty is impossible, clamp it
 
     tmp.qty  = (uint16_t)q;
     tmp.lent = (uint16_t)l;
 
-    items[outCount++] = tmp;
+    target[outCount++] = tmp;
   }
 
-  if (skippedEmpty) Serial.printf("WARNING: skipped %u record(s) with empty name\n", skippedEmpty);
-  if (clampedFields) Serial.printf("WARNING: clamped %u out-of-range field(s)\n", clampedFields);
+  if (skippedOut) Serial.printf("WARNING: skipped %u record(s) with empty name\n", skippedOut);
+  if (clampedOut) Serial.printf("WARNING: clamped %u out-of-range field(s)\n", clampedOut);
 
   return true;
 }
@@ -576,8 +712,8 @@ bool tryLoadFrom(const char* path) {
   File f = LittleFS.open(path, "r");
   if (!f) return false;
 
-  uint16_t count = 0;
-  bool ok = parseInventoryFromFile(f, count);
+  uint16_t count = 0, skipped = 0, clamped = 0;
+  bool ok = parseInventoryFromFile(f, items, count, skipped, clamped);
   f.close();
 
   if (!ok) return false;
@@ -721,6 +857,36 @@ bool saveInventory() {
 // ============================================================
 //  SEARCH
 // ============================================================
+// Search aliases: typing a KEY also pulls in items whose name contains
+// the paired substring, in addition to normal prefix matching — lets
+// "OLED" find "SH1106", "GPS" find "Neo 6M GPS module", etc. without
+// touching the underlying inventory data. Grounded in this device's
+// actual inventory categories; harmless (just matches nothing extra) if
+// a given category isn't currently stocked.
+struct SearchAlias { const char* key; const char* expandsTo; };
+const SearchAlias SEARCH_ALIASES[] = {
+  { "OLED",      "SH1106" },
+  { "DISPLAY",   "SH1106" },
+  { "DISPLAY",   "SEGMENT" },
+  { "BT",        "BLUETOOTH" },
+  { "BT",        "HC05" },
+  { "BLE",       "BLUETOOTH" },
+  { "WIFI",      "ESP" },
+  { "INFRARED",  "IR" },
+  { "MOTION",    "PIR" },
+  { "LIGHT",     "LDR" },
+  { "GSM",       "SIM" },
+  { "GPS",       "NEO" },
+  { "ULTRASONIC","HC-SR04" },
+  { "DISTANCE",  "HC-SR04" },
+  { "WIRELESS",  "NRF" },
+  { "WIRELESS",  "RF" },
+  { "AUDIO",     "SPEAKER" },
+  { "AUDIO",     "MIC" },
+  { "RTC",       "DS3231" },
+};
+const uint8_t SEARCH_ALIAS_COUNT = sizeof(SEARCH_ALIASES) / sizeof(SEARCH_ALIASES[0]);
+
 void runSearch() {
   resultCount = 0;
   if (lentMode) {
@@ -735,6 +901,20 @@ void runSearch() {
     for (uint16_t i = 0; i < itemCount && resultCount < MAX_RECORDS; i++) {
       if (strncasecmp(items[i].name, query, queryLen) == 0) {
         resultIndices[resultCount++] = i;
+      }
+    }
+
+    // Alias expansion: if the typed query is a prefix of a known alias
+    // key (so it kicks in progressively while multi-tap typing, same as
+    // normal search), also pull in items containing that alias's
+    // substring, skipping anything already found above.
+    for (uint8_t a = 0; a < SEARCH_ALIAS_COUNT && resultCount < MAX_RECORDS; a++) {
+      if (strncasecmp(SEARCH_ALIASES[a].key, query, queryLen) != 0) continue;
+      for (uint16_t i = 0; i < itemCount && resultCount < MAX_RECORDS; i++) {
+        if (!containsCaseInsensitive(items[i].name, SEARCH_ALIASES[a].expandsTo)) continue;
+        bool dup = false;
+        for (uint16_t r = 0; r < resultCount; r++) if (resultIndices[r] == i) { dup = true; break; }
+        if (!dup) resultIndices[resultCount++] = i;
       }
     }
   }
@@ -761,6 +941,15 @@ void setError(const char* msg) {
   strlcpy(errorMsg, msg, sizeof(errorMsg));
   errorMsgUntil = millis() + ERROR_MSG_DURATION_MS;
   startVibration(VIBRATE_ERROR_MS); // vibration = routine feedback; buzzer stays reserved for alarms
+  triggerFlash(120);
+}
+
+// A single quick full-screen invert, for "event" level feedback
+// (successful lend/return, errors) — the lightest tier of animation
+// per the Stage 6 philosophy: Idle (none) < Navigation (small focus
+// animation) < Events (this, and the alarm's repeating version).
+void triggerFlash(unsigned long ms) {
+  flashUntil = millis() + ms;
 }
 
 void startVibration(unsigned long ms) {
@@ -785,11 +974,13 @@ void handleKey(char k) {
     case STATE_ITEM_DETAIL: handleDetailKey(k);        break;
     case STATE_LEND_QTY:    handleQtyKey(k, true);     break;
     case STATE_RETURN_QTY:  handleQtyKey(k, false);    break;
-    case STATE_MENU:        handleMenuKey(k);          break;
+    case STATE_HOME:        handleHomeKey(k);          break;
     case STATE_TIMER:       handleTimerKey(k);         break;
     case STATE_STOPWATCH:   handleStopwatchKey(k);     break;
     case STATE_WIFI:        handleWifiKey(k);          break;
-    case STATE_CLOCK:       handleClockKey(k);          break;
+    case STATE_CLOCK:       handleClockKey(k);         break;
+    case STATE_SETTINGS:    handleSettingsKey(k);      break;
+    case STATE_MORE:        handleMoreKey(k);          break;
     default: break; // IDLE / ALARM are handled in loop()
   }
 }
@@ -825,22 +1016,22 @@ void handleSearchKey(char k) {
   } else if (k == '*') {
     if (lentMode) {                    // leave lent list -> menu
       lentMode = false;
-      state = STATE_MENU;
+      state = STATE_HOME;
     } else if (queryLen == 0) {        // nothing to clear -> back to menu
-      state = STATE_MENU;
+      state = STATE_HOME;
     } else {
       queryLen = 0;
       query[0] = 0;
       lastMultitapKey = 0;
       runSearch();
     }
-  } else if (k == 'C') {
+  } else if (k == 'C' || k == 'A') { // C (legacy) and A (Stage 6 "browse") both move up
     if (resultCount > 0) {
       selectedResult--;
       if (selectedResult < 0) selectedResult = resultCount - 1;
       adjustScroll();
     }
-  } else if (k == 'D') {
+  } else if (k == 'D' || k == 'B') { // D (legacy) and B (Stage 6 "browse") both move down
     if (resultCount > 0) {
       selectedResult++;
       if (selectedResult >= (int16_t)resultCount) selectedResult = 0;
@@ -853,7 +1044,6 @@ void handleSearchKey(char k) {
       state = STATE_ITEM_DETAIL;
     }
   }
-  // A / B have no meaning until an item is selected — ignored here
 }
 
 void handleDetailKey(char k) {
@@ -928,6 +1118,7 @@ void handleQtyKey(char k, bool isLend) {
     }
     if (isLend) sessionLendUnits += qv; else sessionReturnUnits += qv;
     startVibration(VIBRATE_CONFIRM_MS); // vibration = routine feedback; buzzer stays reserved for alarms
+    triggerFlash(100);
     state = STATE_ITEM_DETAIL;
   }
 }
@@ -935,45 +1126,58 @@ void handleQtyKey(char k, bool isLend) {
 // ============================================================
 //  RENDERING
 // ============================================================
+// Terminal-style search screen: a title line, the typed query as its
+// own "> query_" prompt line, then compact result rows with the
+// available quantity right-aligned, and a fixed hint line at the
+// bottom. VISIBLE_RESULT_LINES (3) is sized to fit this layout exactly.
 void drawSearchScreen() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
 
-  if (lentMode) {
-    u8g2.drawStr(0, 9, "LENT OUT");
-  } else {
-    u8g2.drawStr(0, 9, ">");
-    u8g2.drawStr(8, 9, query);
+  u8g2.drawStr(0, 8, lentMode ? "LENT OUT" : "SEARCH");
+
+  if (!lentMode) {
+    u8g2.drawStr(0, 19, ">");
+    u8g2.drawStr(8, 19, query);
     if ((millis() / 500) % 2 == 0) {
       int w = u8g2.getStrWidth(query);
-      u8g2.drawStr(8 + w, 9, "_");
+      u8g2.drawStr(8 + w, 19, "_");
     }
+    u8g2.drawHLine(0, 21, 128);
+  } else {
+    u8g2.drawHLine(0, 10, 128);
   }
-  u8g2.drawHLine(0, 11, 128);
+
+  int resultsTop = lentMode ? 22 : 32;
 
   if (lentMode && resultCount == 0) {
-    u8g2.drawStr(0, 28, "Nothing lent out");
+    u8g2.drawStr(0, resultsTop, "Nothing lent out");
   } else if (!lentMode && queryLen == 0) {
-    u8g2.drawStr(0, 28, "Type to search...");
+    u8g2.drawStr(0, resultsTop, "Type to search...");
   } else if (resultCount == 0) {
-    u8g2.drawStr(0, 28, "No matches");
+    u8g2.drawStr(0, resultsTop, "No matches");
   } else {
-    int y = 22;
+    int y = resultsTop;
     for (int i = 0; i < VISIBLE_RESULT_LINES && (scrollOffset + i) < (int16_t)resultCount; i++) {
       int ridx = scrollOffset + i;
       InventoryItem &it = items[resultIndices[ridx]];
-      char line[24];
+
+      char nameBuf[18];
       char prefix = (ridx == selectedResult) ? '>' : ' ';
-      snprintf(line, sizeof(line), "%c%.20s", prefix, it.name);
-      u8g2.drawStr(0, y, line);
-      y += 12;
-    }
-    if (resultCount > VISIBLE_RESULT_LINES) {
-      char cnt[12];
-      snprintf(cnt, sizeof(cnt), "%d/%d", selectedResult + 1, resultCount);
-      u8g2.drawStr(96, 63, cnt);
+      snprintf(nameBuf, sizeof(nameBuf), "%c%.14s", prefix, it.name);
+      u8g2.drawStr(0, y, nameBuf);
+
+      char qtyBuf[6];
+      snprintf(qtyBuf, sizeof(qtyBuf), "%d", availableOf(it));
+      int qw = u8g2.getStrWidth(qtyBuf);
+      u8g2.drawStr(128 - qw, y, qtyBuf);
+
+      y += 10;
     }
   }
+
+  u8g2.drawHLine(0, 53, 128);
+  u8g2.drawStr(0, 63, "A/B browse  #:select");
   u8g2.sendBuffer();
 }
 
@@ -1002,6 +1206,12 @@ void drawItemDetail() {
     u8g2.drawStr(0, 60, errorMsg);
   } else {
     u8g2.drawStr(0, 60, "A:Lend B:Return *:Back");
+  }
+
+  if (millis() < flashUntil) {
+    u8g2.setDrawColor(2);
+    u8g2.drawBox(0, 0, 128, 64);
+    u8g2.setDrawColor(1);
   }
   u8g2.sendBuffer();
 }
@@ -1032,6 +1242,12 @@ void drawQtyScreen(bool isLend) {
   } else {
     u8g2.drawStr(0, 60, "#:OK *:Del/Back");
   }
+
+  if (millis() < flashUntil) {
+    u8g2.setDrawColor(2);
+    u8g2.drawBox(0, 0, 128, 64);
+    u8g2.setDrawColor(1);
+  }
   u8g2.sendBuffer();
 }
 
@@ -1052,6 +1268,18 @@ void drawNoDataScreen() {
 //   on-demand Wi-Fi, optional RTC clock/alarm, speaker + key-click vibration)
 // ============================================================
 
+// A short original jingle (not a reproduction of any specific song) used
+// as the alarm "ringtone" — played on loop until dismissed. freq=0 is a
+// rest (silence).
+struct AlarmNote { uint16_t freq; uint16_t durMs; };
+const AlarmNote ALARM_MELODY[] = {
+  {880, 120}, {988, 120}, {1047, 120}, {1175, 120},
+  {1319, 220}, {0, 70},
+  {1175, 120}, {1047, 120}, {988, 120}, {880, 220},
+  {0, 300}
+};
+const uint8_t ALARM_MELODY_LEN = sizeof(ALARM_MELODY) / sizeof(ALARM_MELODY[0]);
+
 uint32_t uptimeSeconds() {
   return (uint32_t)(esp_timer_get_time() / 1000000ULL);
 }
@@ -1067,6 +1295,14 @@ void formatMMSS(char* buf, size_t n, uint32_t s) {
   uint32_t m = s / 60;
   uint32_t sec = s % 60;
   snprintf(buf, n, "%02lu:%02lu", (unsigned long)m, (unsigned long)sec);
+}
+
+void formatMMSSms(char* buf, size_t n, unsigned long totalMs) {
+  unsigned long ms = totalMs % 1000;
+  unsigned long totalSec = totalMs / 1000;
+  unsigned long m = totalSec / 60;
+  unsigned long sec = totalSec % 60;
+  snprintf(buf, n, "%02lu:%02lu.%03lu", m, sec, ms);
 }
 
 // ---- Display power ----
@@ -1142,7 +1378,13 @@ void updateTimer() {
     startAlarm("Work done! Break?");
   } else if (timerKind == TIMER_POMO_BREAK) {
     timerKind = TIMER_NONE;
-    startAlarm("Break over!");
+    if (pomoCycleIndex < POMO_CYCLES_PER_SESSION) {
+      pendingNextFocus = true;
+      startAlarm("Break over!");
+    } else {
+      pomoCycleIndex = 0; // whole session complete
+      startAlarm("Pomodoro done!");
+    }
   } else {
     timerKind = TIMER_NONE;
     startAlarm("Timer done!");
@@ -1156,8 +1398,14 @@ void startAlarm(const char* msg) {
   strlcpy(alarmMsg, msg, sizeof(alarmMsg));
   state = STATE_ALARM;
   wakeDisplay();
-  toneOn = false;
-  toneUntil = millis(); // fire the first beep immediately
+
+  alarmNoteIdx = 0;
+  alarmNoteStartMs = millis();
+#if SOUND_ENABLED
+  if (ALARM_MELODY[0].freq > 0) tone(SPEAKER_PIN, ALARM_MELODY[0].freq);
+  else noTone(SPEAKER_PIN);
+#endif
+  startVibration(120);
 }
 
 void stopAlarm() {
@@ -1173,8 +1421,12 @@ void dismissAlarm() {
   if (pendingBreak) {
     pendingBreak = false;
     startTimer(TIMER_POMO_BREAK, (unsigned long)POMO_BREAK_MIN * 60000UL);
+  } else if (pendingNextFocus) {
+    pendingNextFocus = false;
+    pomoCycleIndex++;
+    startTimer(TIMER_POMO_WORK, (unsigned long)POMO_WORK_MIN * 60000UL);
   } else {
-    state = STATE_MENU;
+    state = STATE_HOME;
     menuSel = 0;
     menuScroll = 0;
   }
@@ -1189,17 +1441,18 @@ void updateAlarm() {
     return;
   }
 
-  if (now >= toneUntil) {
-    toneOn = !toneOn;
-    if (toneOn) {
+  // Step through the melody — each note plays for its own duration, then
+  // we advance (looping) to the next, with a brief vibration pulse on
+  // every sounded (non-rest) note so it's also felt, not just heard.
+  if (now - alarmNoteStartMs >= ALARM_MELODY[alarmNoteIdx].durMs) {
+    alarmNoteIdx = (alarmNoteIdx + 1) % ALARM_MELODY_LEN;
+    alarmNoteStartMs = now;
+    const AlarmNote &n = ALARM_MELODY[alarmNoteIdx];
 #if SOUND_ENABLED
-      tone(SPEAKER_PIN, 2000, 250);
+    if (n.freq > 0) tone(SPEAKER_PIN, n.freq);
+    else noTone(SPEAKER_PIN);
 #endif
-      startVibration(200);
-      toneUntil = now + 350;
-    } else {
-      toneUntil = now + 150;
-    }
+    if (n.freq > 0) startVibration(n.durMs < 150 ? n.durMs : 150);
   }
 }
 
@@ -1213,36 +1466,85 @@ uint8_t bcdToDec(uint8_t b) { return (b / 16) * 10 + (b % 16); }
 uint8_t decToBcd(uint8_t d) { return ((d / 10) << 4) + (d % 10); }
 
 bool detectRTC() {
-  Wire.beginTransmission(RTC_I2C_ADDR);
-  return (Wire.endTransmission() == 0);
+  RTCWire.beginTransmission(RTC_I2C_ADDR);
+  return (RTCWire.endTransmission() == 0);
+}
+
+// Prints every address that answers on the RTC's dedicated bus — run
+// automatically at boot if no RTC was found, purely to help diagnose a
+// wiring/address problem from the Serial Monitor.
+void scanRtcBus() {
+  Serial.println("Scanning RTC I2C bus (SDA=" + String(RTC_SDA_PIN) + ", SCL=" + String(RTC_SCL_PIN) + ")...");
+  uint8_t found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    RTCWire.beginTransmission(addr);
+    if (RTCWire.endTransmission() == 0) {
+      Serial.printf("  Device found at 0x%02X\n", addr);
+      found++;
+    }
+  }
+  if (!found) Serial.println("  No I2C devices found on this bus — check wiring and power.");
 }
 
 bool readRtcTime(uint8_t &h, uint8_t &m, uint8_t &s) {
-  Wire.beginTransmission(RTC_I2C_ADDR);
-  Wire.write((uint8_t)0x00);
-  if (Wire.endTransmission() != 0) return false;
-  if (Wire.requestFrom((int)RTC_I2C_ADDR, 3) != 3) return false;
+  RTCWire.beginTransmission(RTC_I2C_ADDR);
+  RTCWire.write((uint8_t)0x00);
+  if (RTCWire.endTransmission() != 0) return false;
+  if (RTCWire.requestFrom((int)RTC_I2C_ADDR, 3) != 3) return false;
 
-  uint8_t rs = Wire.read();
-  uint8_t rm = Wire.read();
-  uint8_t rh = Wire.read();
+  uint8_t rs = RTCWire.read();
+  uint8_t rm = RTCWire.read();
+  uint8_t rh = RTCWire.read();
   s = bcdToDec(rs & 0x7F);
   m = bcdToDec(rm & 0x7F);
   h = bcdToDec(rh & 0x3F); // strip 12h/PM bits — we always write 24h mode
   return true;
 }
 
+// Reads time AND date/month/year (DS3231 registers 0x00-0x06) in one
+// transaction — used by the idle clock screen. Register 3 (day-of-week)
+// is read but discarded; we derive nothing from it.
+bool readRtcFull(uint8_t &h, uint8_t &m, uint8_t &s, uint8_t &date, uint8_t &month, uint8_t &year) {
+  RTCWire.beginTransmission(RTC_I2C_ADDR);
+  RTCWire.write((uint8_t)0x00);
+  if (RTCWire.endTransmission() != 0) return false;
+  if (RTCWire.requestFrom((int)RTC_I2C_ADDR, 7) != 7) return false;
+
+  uint8_t rs = RTCWire.read();
+  uint8_t rm = RTCWire.read();
+  uint8_t rh = RTCWire.read();
+  RTCWire.read(); // day-of-week, unused
+  uint8_t rdate = RTCWire.read();
+  uint8_t rmonth = RTCWire.read();
+  uint8_t ryear = RTCWire.read();
+
+  s = bcdToDec(rs & 0x7F);
+  m = bcdToDec(rm & 0x7F);
+  h = bcdToDec(rh & 0x3F);
+  date = bcdToDec(rdate & 0x3F);
+  month = bcdToDec(rmonth & 0x1F); // bit7 is the century flag, ignored (we assume 20xx)
+  year = bcdToDec(ryear);
+  return true;
+}
+
 bool writeRtcTime(uint8_t h, uint8_t m, uint8_t s) {
-  Wire.beginTransmission(RTC_I2C_ADDR);
-  Wire.write((uint8_t)0x00);
-  Wire.write(decToBcd(s));
-  Wire.write(decToBcd(m));
-  Wire.write(decToBcd(h) & 0x3F); // bit6=0 forces 24-hour mode on DS3231
-  return (Wire.endTransmission() == 0);
+  RTCWire.beginTransmission(RTC_I2C_ADDR);
+  RTCWire.write((uint8_t)0x00);
+  RTCWire.write(decToBcd(s));
+  RTCWire.write(decToBcd(m));
+  RTCWire.write(decToBcd(h) & 0x3F); // bit6=0 forces 24-hour mode on DS3231
+  return (RTCWire.endTransmission() == 0);
 }
 
 void formatClock(char* buf, size_t n, uint8_t h, uint8_t m, uint8_t s) {
   snprintf(buf, n, "%02u:%02u:%02u", h, m, s);
+}
+
+const char* RTC_MONTH_NAMES[] = { "JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC" };
+
+void formatRtcDate(char* buf, size_t n, uint8_t date, uint8_t month, uint8_t year) {
+  const char* mn = (month >= 1 && month <= 12) ? RTC_MONTH_NAMES[month - 1] : "???";
+  snprintf(buf, n, "%02u %s 20%02u", date, mn, year);
 }
 
 // Throttled to ~1/sec: refreshes the cached time used for display and
@@ -1253,12 +1555,13 @@ void updateRtcAlarm() {
   if (now - lastRtcCheckMs < 900) return;
   lastRtcCheckMs = now;
 
-  uint8_t h, m, s;
-  if (!readRtcTime(h, m, s)) {
+  uint8_t h, m, s, dd, mo, yy;
+  if (!readRtcFull(h, m, s, dd, mo, yy)) {
     rtcPresent = false; // lost comms mid-session — degrade gracefully, don't crash
     return;
   }
   cachedRtcHour = h; cachedRtcMin = m; cachedRtcSec = s;
+  cachedRtcDate = dd; cachedRtcMonth = mo; cachedRtcYear = yy;
 
   if (rtcAlarmEnabled && h == rtcAlarmHour && m == rtcAlarmMin && lastAlarmFiredMinute != m) {
     lastAlarmFiredMinute = m;
@@ -1269,7 +1572,7 @@ void updateRtcAlarm() {
 
 void handleClockKey(char k) {
   if (!rtcPresent) {
-    if (k == '*') state = STATE_MENU; // nothing else to do without an RTC — no crash, just back out
+    if (k == '*') state = STATE_HOME; // nothing else to do without an RTC — no crash, just back out
     return;
   }
 
@@ -1277,7 +1580,7 @@ void handleClockKey(char k) {
     if (k == 'A') { clockSubMode = CLOCK_SET_TIME; clockDigitsLen = 0; clockDigits[0] = 0; }
     else if (k == 'B') { clockSubMode = CLOCK_SET_ALARM; clockDigitsLen = 0; clockDigits[0] = 0; }
     else if (k == 'D') { rtcAlarmEnabled = !rtcAlarmEnabled; if (rtcAlarmEnabled) lastAlarmFiredMinute = 255; }
-    else if (k == '*') { state = STATE_MENU; }
+    else if (k == '*') { state = STATE_HOME; }
     return;
   }
 
@@ -1346,65 +1649,168 @@ void drawClockScreen() {
   u8g2.sendBuffer();
 }
 
-// ---- Menu ----
+// ---- Home launcher: 3x3 icon grid ----
+// menuSel doubles as the grid cursor (0-8, row-major). Unlike the old
+// scrolling list this is kept because all 9 items always fit one screen
+// — no scrolling is needed, so adjustMenuScroll() has no caller anymore
+// (left defined, harmless, in case a future longer list wants it back).
 void adjustMenuScroll() {
   if (menuSel < menuScroll) menuScroll = menuSel;
   if (menuSel >= menuScroll + VISIBLE_RESULT_LINES) menuScroll = menuSel - VISIBLE_RESULT_LINES + 1;
 }
 
-void activateMenuItem(uint8_t idx) {
+// ---- Icons: simple vector-drawn monochrome glyphs, ~12-14px, one per
+// home-grid slot. Deliberately geometric/outline rather than filled
+// blobs, to stay crisp at this size and match the rest of the UI's line
+// language. Order matches HOME_ITEMS[] / HOME_ICONS[].
+void iconTimer(int cx, int cy) {
+  u8g2.drawTriangle(cx - 5, cy - 5, cx + 5, cy - 5, cx, cy);
+  u8g2.drawTriangle(cx - 5, cy + 5, cx + 5, cy + 5, cx, cy);
+}
+void iconPomodoro(int cx, int cy) {
+  u8g2.drawCircle(cx, cy + 1, 5);
+  u8g2.drawLine(cx, cy - 4, cx + 3, cy - 7);
+}
+void iconStopwatch(int cx, int cy) {
+  u8g2.drawCircle(cx, cy, 5);
+  u8g2.drawBox(cx - 2, cy - 7, 4, 2);
+  u8g2.drawLine(cx, cy, cx, cy - 3);
+}
+void iconSearch(int cx, int cy) {
+  u8g2.drawCircle(cx - 1, cy - 1, 4);
+  u8g2.drawLine(cx + 2, cy + 2, cx + 5, cy + 5);
+}
+void iconWifi(int cx, int cy) {
+  u8g2.drawDisc(cx, cy + 5, 1);
+  u8g2.drawCircle(cx, cy + 5, 4, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
+  u8g2.drawCircle(cx, cy + 5, 7, U8G2_DRAW_UPPER_LEFT | U8G2_DRAW_UPPER_RIGHT);
+}
+void iconClock(int cx, int cy) {
+  u8g2.drawCircle(cx, cy, 5);
+  u8g2.drawLine(cx, cy, cx, cy - 3);
+  u8g2.drawLine(cx, cy, cx + 3, cy);
+}
+void iconInventory(int cx, int cy) { // open-crate shape for the Inventory/lent-items slot
+  u8g2.drawFrame(cx - 5, cy - 3, 10, 7);
+  u8g2.drawLine(cx - 5, cy - 3, cx, cy - 6);
+  u8g2.drawLine(cx + 5, cy - 3, cx, cy - 6);
+}
+void iconSettings(int cx, int cy) { // circle + 4 radiating ticks, approximating a gear
+  u8g2.drawCircle(cx, cy, 3);
+  u8g2.drawLine(cx, cy - 6, cx, cy - 4);
+  u8g2.drawLine(cx, cy + 4, cx, cy + 6);
+  u8g2.drawLine(cx - 6, cy, cx - 4, cy);
+  u8g2.drawLine(cx + 4, cy, cx + 6, cy);
+}
+void iconMore(int cx, int cy) {
+  u8g2.drawDisc(cx - 5, cy, 1);
+  u8g2.drawDisc(cx, cy, 1);
+  u8g2.drawDisc(cx + 5, cy, 1);
+}
+
+typedef void (*IconDrawFn)(int cx, int cy);
+IconDrawFn HOME_ICONS[] = {
+  iconTimer, iconPomodoro, iconStopwatch,
+  iconSearch, iconWifi, iconClock,
+  iconInventory, iconSettings, iconMore
+};
+
+const int HOME_COL_X[3] = { 21, 64, 107 };
+const int HOME_ROW_Y[3] = { 11, 30, 48 };
+
+// Fast (~150ms), lightweight "selected" indicator: four corner brackets
+// that nudge in and out on a short cycle. Cheap to draw (8 short lines,
+// no fill) and reads clearly as focus without a heavy redraw.
+void drawSelectionAnimation(int cx, int cy) {
+  bool expanded = (millis() / 150) % 2;
+  int half = expanded ? 11 : 9;
+  int x0 = cx - half, x1 = cx + half;
+  int y0 = cy - half, y1 = cy + half;
+  u8g2.drawLine(x0, y0, x0 + 3, y0);
+  u8g2.drawLine(x0, y0, x0, y0 + 3);
+  u8g2.drawLine(x1 - 3, y0, x1, y0);
+  u8g2.drawLine(x1, y0, x1, y0 + 3);
+  u8g2.drawLine(x0, y1 - 3, x0, y1);
+  u8g2.drawLine(x0, y1, x0 + 3, y1);
+  u8g2.drawLine(x1 - 3, y1, x1, y1);
+  u8g2.drawLine(x1, y1 - 3, x1, y1);
+}
+
+void drawHomeGrid() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+
+  for (uint8_t i = 0; i < HOME_ITEM_COUNT; i++) {
+    int row = i / 3, col = i % 3;
+    int cx = HOME_COL_X[col], cy = HOME_ROW_Y[row];
+    HOME_ICONS[i](cx, cy);
+    if (i == menuSel) drawSelectionAnimation(cx, cy);
+  }
+
+  const char* label = HOME_ITEMS[menuSel];
+  int w = u8g2.getStrWidth(label);
+  u8g2.drawStr((128 - w) / 2, 63, label);
+  u8g2.sendBuffer();
+}
+
+void activateHomeItem(uint8_t idx) {
   switch (idx) {
-    case 0: // Search parts
-      lentMode = false;
-      state = STATE_SEARCH;
-      runSearch();
-      break;
-    case 1: // Lent items
-      lentMode = true;
-      state = STATE_SEARCH;
-      runSearch();
-      break;
-    case 2: // Timer
+    case 0: // Timer
       timerKind = TIMER_NONE;
       timerInputLen = 0;
       timerInput[0] = 0;
       state = STATE_TIMER;
       break;
-    case 3: // Pomodoro
+    case 1: // Pomodoro
+      pomoCycleIndex = 1;
       startTimer(TIMER_POMO_WORK, (unsigned long)POMO_WORK_MIN * 60000UL);
       break;
-    case 4: // Stopwatch
+    case 2: // Stopwatch
       swRunning = false;
       swAccumMs = 0;
       state = STATE_STOPWATCH;
       break;
-    case 5: // Wi-Fi
+    case 3: // Search
+      lentMode = false;
+      state = STATE_SEARCH;
+      runSearch();
+      break;
+    case 4: // Wi-Fi
       state = STATE_WIFI;
       break;
-    case 6: // Clock
+    case 5: // Clock
       clockSubMode = CLOCK_VIEW;
       clockDigitsLen = 0;
       clockDigits[0] = 0;
       state = STATE_CLOCK;
       break;
+    case 6: // Inventory (lent-items view — reuses the same search screen/logic)
+      lentMode = true;
+      state = STATE_SEARCH;
+      runSearch();
+      break;
+    case 7: // Settings
+      state = STATE_SETTINGS;
+      break;
+    case 8: // More (placeholder slot)
+      state = STATE_MORE;
+      break;
     default: break;
   }
 }
 
-void handleMenuKey(char k) {
-  if (k == 'C') {
-    menuSel--;
-    if (menuSel < 0) menuSel = MENU_ITEM_COUNT - 1;
-    adjustMenuScroll();
-  } else if (k == 'D') {
-    menuSel++;
-    if (menuSel >= MENU_ITEM_COUNT) menuSel = 0;
-    adjustMenuScroll();
-  } else if (k == '#') {
-    activateMenuItem((uint8_t)menuSel);
-  } else if (k == '*') {
-    state = STATE_IDLE;
-  }
+// Grid navigation: A=left, B=right, C=up, D=down, #=select, *=manual
+// sleep (go straight to the idle clock).
+void handleHomeKey(char k) {
+  int row = menuSel / 3, col = menuSel % 3;
+  if (k == 'A') col = (col + 2) % 3;
+  else if (k == 'B') col = (col + 1) % 3;
+  else if (k == 'C') row = (row + 2) % 3;
+  else if (k == 'D') row = (row + 1) % 3;
+  else if (k == '#') { activateHomeItem((uint8_t)menuSel); return; }
+  else if (k == '*') { state = STATE_IDLE; return; }
+  else return;
+  menuSel = row * 3 + col;
 }
 
 // ---- Timer / stopwatch key handling ----
@@ -1421,7 +1827,7 @@ void handleTimerKey(char k) {
         timerInputLen--;
         timerInput[timerInputLen] = 0;
       } else {
-        state = STATE_MENU;
+        state = STATE_HOME;
       }
     } else if (k == '#') {
       int mins = atoi(timerInput);
@@ -1433,7 +1839,7 @@ void handleTimerKey(char k) {
     }
   } else if (k == '*') {
     timerKind = TIMER_NONE;
-    state = STATE_MENU;
+    state = STATE_HOME;
   }
 }
 
@@ -1446,59 +1852,93 @@ void handleStopwatchKey(char k) {
     swAccumMs = 0;
   } else if (k == '*') {
     if (swRunning) { swAccumMs += millis() - swStartMs; swRunning = false; }
-    state = STATE_MENU;
+    state = STATE_HOME;
   }
 }
 
 // ---- Screens ----
-void drawIdleScreen() {
+// Pure sleep/idle screen: after IDLE_TIMEOUT_MS this shows ONLY the
+// single most relevant number — real time if an RTC answered at boot,
+// otherwise elapsed uptime — with no extra stats cluttering it. (A
+// running Timer/Pomodoro/Stopwatch is already similarly "pure" on its
+// own screen and is shown instead of this one — see loop()/updateIdle().)
+// Minimal "digital watch" idle screen: one big number, centered, with a
+// date line beneath it when an RTC is available — nothing else. No
+// label, no stats, no border. Redraws every loop() call (cheap — a
+// handful of primitives) but the content itself only visibly changes
+// once a second, so it reads as calm rather than busy.
+void drawIdleClock() {
   u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(0, 9, "Inventory Terminal");
-  u8g2.drawHLine(0, 11, 128);
 
-  // Show the real wall-clock time if an RTC answered at boot; otherwise
-  // fall back to elapsed session uptime. Either way this never crashes —
-  // it just picks whichever source of truth is actually available.
-  u8g2.drawStr(0, 20, rtcPresent ? "Time" : "Uptime");
   char big[16];
   if (rtcPresent) formatClock(big, sizeof(big), cachedRtcHour, cachedRtcMin, cachedRtcSec);
   else            formatHMS(big, sizeof(big), uptimeSeconds());
   u8g2.setFont(u8g2_font_logisoso16_tr);
   int w = u8g2.getStrWidth(big);
-  u8g2.drawStr((128 - w) / 2, 40, big);
-  u8g2.setFont(u8g2_font_6x10_tf);
+  int y = rtcPresent ? 36 : 40; // nudge up a little when a date line follows
+  u8g2.drawStr((128 - w) / 2, y, big);
 
-  uint16_t lentCount = 0;
-  for (uint16_t i = 0; i < itemCount; i++) if (items[i].lent > 0) lentCount++;
+  if (rtcPresent) {
+    char dateLine[16];
+    formatRtcDate(dateLine, sizeof(dateLine), cachedRtcDate, cachedRtcMonth, cachedRtcYear);
+    u8g2.setFont(u8g2_font_6x10_tf);
+    int dw = u8g2.getStrWidth(dateLine);
+    u8g2.drawStr((128 - dw) / 2, 52, dateLine);
+  }
 
-  char line1[24]; snprintf(line1, sizeof(line1), "Lent items: %u", lentCount);
-  char line2[24]; snprintf(line2, sizeof(line2), "L:%lu R:%lu WiFi:%s",
-                            (unsigned long)sessionLendUnits, (unsigned long)sessionReturnUnits,
-                            wifiEnabled ? "ON" : "OFF");
-  u8g2.drawStr(0, 52, line1);
-  u8g2.drawStr(0, 63, line2);
   u8g2.sendBuffer();
 }
 
-void drawMenuScreen() {
+void handleSettingsKey(char k) {
+  if (k == '*') state = STATE_HOME;
+}
+
+void drawSettingsScreen() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(0, 9, "MENU");
+  u8g2.drawStr(0, 9, "SETTINGS");
   u8g2.drawHLine(0, 11, 128);
 
-  int y = 22;
-  for (int i = 0; i < VISIBLE_RESULT_LINES && (menuScroll + i) < MENU_ITEM_COUNT; i++) {
-    int idx = menuScroll + i;
-    char line[24];
-    char prefix = (idx == menuSel) ? '>' : ' ';
-    snprintf(line, sizeof(line), "%c%s", prefix, MENU_ITEMS[idx]);
-    u8g2.drawStr(0, y, line);
-    y += 12;
-  }
+  char line[24];
+  snprintf(line, sizeof(line), "Idle timeout: %lus", (unsigned long)(IDLE_TIMEOUT_MS / 1000));
+  u8g2.drawStr(0, 26, line);
+  snprintf(line, sizeof(line), "RTC: %s", rtcPresent ? "detected" : "none");
+  u8g2.drawStr(0, 38, line);
+  snprintf(line, sizeof(line), "Wi-Fi: %s", wifiEnabled ? "ON" : "OFF");
+  u8g2.drawStr(0, 50, line);
+
+  u8g2.drawStr(0, 62, "*:Back  (more soon)");
   u8g2.sendBuffer();
 }
 
+void handleMoreKey(char k) {
+  if (k == '*') state = STATE_HOME;
+}
+
+void drawMoreScreen() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 9, "MORE");
+  u8g2.drawHLine(0, 11, 128);
+  u8g2.drawStr(0, 34, "Coming soon.");
+  u8g2.drawStr(0, 62, "*:Back");
+  u8g2.sendBuffer();
+}
+
+// Simple bordered progress bar: a 1px frame with a filled portion
+// proportional to `fraction` (0..1). Used by both Timer and Pomodoro.
+void drawProgressBar(int x, int y, int w, int h, float fraction) {
+  if (fraction < 0) fraction = 0;
+  if (fraction > 1) fraction = 1;
+  u8g2.drawFrame(x, y, w, h);
+  int fillW = (int)((w - 2) * fraction);
+  if (fillW > 0) u8g2.drawBox(x + 1, y + 1, fillW, h - 2);
+}
+
+// Plain countdown timer: minutes-entry screen, then a running screen
+// with the big remaining time and a progress bar underneath. Pomodoro
+// has its own screen (drawPomodoroScreen) even though it shares the
+// same STATE_TIMER/timerKind machinery — see loop()'s draw switch.
 void drawTimerScreen() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
@@ -1509,18 +1949,50 @@ void drawTimerScreen() {
     u8g2.drawStr(0, 30, line);
     u8g2.drawStr(0, 60, "#:Start *:Del/Back");
   } else {
-    const char* label = (timerKind == TIMER_POMO_WORK)  ? "POMODORO - WORK"  :
-                         (timerKind == TIMER_POMO_BREAK) ? "POMODORO - BREAK" : "TIMER";
-    u8g2.drawStr(0, 12, label);
+    u8g2.drawStr(0, 10, "TIMER");
 
     char rem[10];
     formatMMSS(rem, sizeof(rem), timerRemainingMs() / 1000);
     u8g2.setFont(u8g2_font_logisoso16_tr);
     int w = u8g2.getStrWidth(rem);
-    u8g2.drawStr((128 - w) / 2, 40, rem);
+    u8g2.drawStr((128 - w) / 2, 34, rem);
     u8g2.setFont(u8g2_font_6x10_tf);
-    u8g2.drawStr(0, 60, "*:Cancel");
+
+    float frac = (timerDurationMs > 0)
+      ? (float)(timerDurationMs - timerRemainingMs()) / (float)timerDurationMs : 0;
+    drawProgressBar(8, 42, 112, 10, frac);
+
+    u8g2.drawStr(0, 62, "*:Cancel");
   }
+  u8g2.sendBuffer();
+}
+
+// Pomodoro's own visual identity: progress bar + FOCUS/BREAK label +
+// cycle count (e.g. "FOCUS 2/4"), distinct from the plain Timer screen.
+// The FOCUS<->BREAK transition itself is the alarm screen in between
+// (drawAlarmAnimation) — its invert-pulse doubles as the transition cue.
+void drawPomodoroScreen() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 10, "POMODORO");
+
+  char rem[10];
+  formatMMSS(rem, sizeof(rem), timerRemainingMs() / 1000);
+  u8g2.setFont(u8g2_font_logisoso16_tr);
+  int w = u8g2.getStrWidth(rem);
+  u8g2.drawStr((128 - w) / 2, 34, rem);
+  u8g2.setFont(u8g2_font_6x10_tf);
+
+  float frac = (timerDurationMs > 0)
+    ? (float)(timerDurationMs - timerRemainingMs()) / (float)timerDurationMs : 0;
+  drawProgressBar(8, 42, 112, 10, frac);
+
+  char info[20];
+  snprintf(info, sizeof(info), "%s  %u/%u",
+           timerKind == TIMER_POMO_WORK ? "FOCUS" : "BREAK",
+           (unsigned)pomoCycleIndex, (unsigned)POMO_CYCLES_PER_SESSION);
+  int iw = u8g2.getStrWidth(info);
+  u8g2.drawStr((128 - iw) / 2, 62, info);
   u8g2.sendBuffer();
 }
 
@@ -1530,8 +2002,8 @@ void drawStopwatchScreen() {
   u8g2.drawStr(0, 12, "STOPWATCH");
 
   unsigned long ms = swAccumMs + (swRunning ? (millis() - swStartMs) : 0);
-  char t[10];
-  formatMMSS(t, sizeof(t), ms / 1000);
+  char t[14];
+  formatMMSSms(t, sizeof(t), ms);
   u8g2.setFont(u8g2_font_logisoso16_tr);
   int w = u8g2.getStrWidth(t);
   u8g2.drawStr((128 - w) / 2, 40, t);
@@ -1541,12 +2013,26 @@ void drawStopwatchScreen() {
   u8g2.sendBuffer();
 }
 
-void drawAlarmScreen() {
+// Alarm screen with a non-blocking invert-pulse animation: normal ->
+// inverted -> normal -> inverted, while the buzzer melody plays. Uses
+// u8g2's XOR draw mode (color 2) over the whole buffer after normal
+// content is drawn — cheap, and works because the display is run in
+// full-buffer (F) mode. Timing is independent of the melody's own
+// note-by-note timing (updateAlarm()), just a steady ~250ms flip, which
+// reads as "pulsing" without needing to be millisecond-synced to it.
+void drawAlarmAnimation() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 20, alarmMsg);
   u8g2.drawStr(0, 40, "Press any key");
   u8g2.drawStr(0, 52, "to dismiss");
+
+  bool inverted = (millis() / 250) % 2;
+  if (inverted) {
+    u8g2.setDrawColor(2); // XOR — flips every pixel drawn so far
+    u8g2.drawBox(0, 0, 128, 64);
+    u8g2.setDrawColor(1);
+  }
   u8g2.sendBuffer();
 }
 
@@ -1591,6 +2077,11 @@ void setupWebServer() {
   httpServer.on("/edit", HTTP_POST, handleWebEditSubmit);
   httpServer.on("/delete", HTTP_GET, handleWebDeleteConfirm);
   httpServer.on("/delete", HTTP_POST, handleWebDeleteSubmit);
+  httpServer.on("/import", HTTP_GET, handleImportForm);
+  httpServer.on("/import", HTTP_POST, handleImportSubmit, handleImportUpload);
+  httpServer.on("/export", HTTP_GET, handleExport);
+  httpServer.on("/restore", HTTP_GET, handleRestoreBackup);
+  httpServer.on("/restore", HTTP_POST, handleRestoreSubmit);
   httpServer.onNotFound(handleWebNotFound);
 }
 
@@ -1620,7 +2111,7 @@ void handleWifiKey(char k) {
   if (k == '#') {
     if (wifiEnabled) stopWiFi(); else startWiFi();
   } else if (k == '*') {
-    state = STATE_MENU;
+    state = STATE_HOME;
   }
 }
 
@@ -1660,7 +2151,8 @@ String htmlHeader(const char* title) {
        ".err{color:#b00;font-weight:bold}"
        ".warn{color:#a60}"
        "nav a{margin-right:12px}</style></head><body>";
-  h += "<nav><a href='/'>Status</a><a href='/inventory'>Inventory</a><a href='/add'>Add Item</a></nav>";
+  h += "<nav><a href='/'>Status</a><a href='/inventory'>Inventory</a><a href='/add'>Add Item</a>"
+       "<a href='/import'>Import</a><a href='/export'>Export</a></nav>";
   h += "<h2>"; h += title; h += "</h2>";
   return h;
 }
@@ -1854,6 +2346,7 @@ void handleWebInventory() {
   if (shown == 0) httpServer.sendContent("<tr><td colspan='7'>No matching items</td></tr>");
 
   httpServer.sendContent("</table>");
+  httpServer.sendContent("<p><small><a href='/restore'>Restore from backup</a></small></p>");
   httpServer.sendContent(htmlFooter());
 }
 
@@ -2007,7 +2500,238 @@ void handleWebDeleteSubmit() {
 // network" prompt on most phones/laptops. OS-specific handling can be
 // refined later if needed.
 void handleWebNotFound() {
-  String target = "http://" + WiFi.softAPIP().toString() + "/";
+  // A bare redirect is enough for most captive-portal auto-detectors, but
+  // some (notably a few Android/Windows variants) don't reliably act on
+  // a Location header with no body. Sending a tiny HTML page with both a
+  // meta-refresh AND a manual link covers those too, while staying tiny
+  // and framework-free.
+  String ip = WiFi.softAPIP().toString();
+  String target = "http://" + ip + "/";
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                 "<meta http-equiv='refresh' content='0;url=" + target + "'>"
+                 "<title>Inventory Terminal</title></head><body>"
+                 "<p>Redirecting to the Inventory Terminal\342\200\246 "
+                 "<a href='" + target + "'>tap here</a> if nothing happens.</p>"
+                 "</body></html>";
   httpServer.sendHeader("Location", target, true);
-  httpServer.send(302, "text/plain", "");
+  httpServer.send(302, "text/html", html);
+}
+
+// ---- JSON import / export / backup restore ----
+
+// Same escaping as appendEscaped(), but for JSON string values (only
+// '"' and '\' need escaping) rather than HTML.
+void appendJsonEscaped(char* dest, size_t destSize, const char* src) {
+  size_t di = 0;
+  for (const char* p = src; *p && di < destSize - 1; p++) {
+    if (*p == '"' || *p == '\\') {
+      if (di + 2 >= destSize - 1) break;
+      dest[di++] = '\\';
+      dest[di++] = *p;
+    } else {
+      dest[di++] = *p;
+    }
+  }
+  dest[di] = 0;
+}
+
+// Handles one chunk of a multipart file upload, streaming it straight to
+// a temp file on LittleFS rather than buffering the whole thing in RAM.
+// Enforces MAX_IMPORT_BYTES as it goes, so an oversized upload is
+// rejected early rather than after fully landing on flash.
+void handleImportUpload() {
+  HTTPUpload &upload = httpServer.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    importBytes = 0;
+    importErr[0] = 0;
+    LittleFS.remove(IMPORT_TMP_FILE); // best effort, in case a previous attempt left one behind
+    importFile = LittleFS.open(IMPORT_TMP_FILE, "w");
+    importInProgress = (bool)importFile;
+    if (!importInProgress) strlcpy(importErr, "Could not create temp file", sizeof(importErr));
+
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!importInProgress) return;
+    importBytes += upload.currentSize;
+    if (importBytes > MAX_IMPORT_BYTES) {
+      importInProgress = false;
+      strlcpy(importErr, "File too large", sizeof(importErr));
+      importFile.close();
+      LittleFS.remove(IMPORT_TMP_FILE);
+      return;
+    }
+    importFile.write(upload.buf, upload.currentSize);
+
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (importInProgress) importFile.close();
+  }
+}
+
+// Parses the uploaded file into a scratch heap buffer (never touching
+// the live inventory until validated), carries over each matching
+// item's currently-lent quantity from the live device state (the
+// device, not an old export, is the source of truth for what's
+// actually checked out right now), then commits via the existing
+// Stage 2 safe-save path.
+bool importInventoryFile(const char* path, uint16_t &resultCount, uint16_t &skippedOut,
+                          uint16_t &clampedOut, char* errOut, size_t errOutSize) {
+  File f = LittleFS.open(path, "r");
+  if (!f) { snprintf(errOut, errOutSize, "Could not reopen uploaded file"); return false; }
+
+  InventoryItem* newItems = (InventoryItem*)malloc(sizeof(InventoryItem) * MAX_RECORDS);
+  if (!newItems) { f.close(); snprintf(errOut, errOutSize, "Out of memory"); return false; }
+
+  uint16_t newCount = 0;
+  bool ok = parseInventoryFromFile(f, newItems, newCount, skippedOut, clampedOut);
+  f.close();
+
+  if (!ok) {
+    free(newItems);
+    snprintf(errOut, errOutSize, "Uploaded file is not valid inventory JSON");
+    return false;
+  }
+  if (newCount == 0) {
+    free(newItems);
+    snprintf(errOut, errOutSize, "Uploaded file has no valid records");
+    return false;
+  }
+
+  for (uint16_t i = 0; i < newCount; i++) {
+    for (uint16_t j = 0; j < itemCount; j++) {
+      if (strcasecmp(newItems[i].name, items[j].name) == 0 &&
+          strcasecmp(newItems[i].location, items[j].location) == 0) {
+        uint16_t carried = items[j].lent;
+        if (carried > newItems[i].qty) carried = newItems[i].qty; // clamp if the new qty shrank
+        newItems[i].lent = carried;
+        break;
+      }
+    }
+  }
+
+  memcpy(items, newItems, sizeof(InventoryItem) * newCount);
+  free(newItems);
+  itemCount = newCount;
+
+  if (!saveInventory()) {
+    loadInventory(); // roll back to whatever's genuinely still on flash
+    snprintf(errOut, errOutSize, "Import parsed OK but save failed — reverted");
+    return false;
+  }
+
+  resultCount = newCount;
+  return true;
+}
+
+void handleImportForm() {
+  String html = htmlHeader("Import Inventory");
+  html += "<p>Upload a JSON file in this device's export format.</p>";
+  html += "<form method='POST' action='/import' enctype='multipart/form-data'>";
+  html += "<input type='file' name='file' accept='.json,application/json' required><br>";
+  html += "<button type='submit'>Import</button> <a href='/inventory'>Cancel</a>";
+  html += "</form>";
+  html += "<p><small>Importing replaces the current inventory list. Quantities "
+          "currently lent out on this device are carried over automatically "
+          "for any item that still matches by name + location.</small></p>";
+  html += htmlFooter();
+  httpServer.send(200, "text/html", html);
+}
+
+void handleImportSubmit() {
+  if (!importInProgress || importErr[0]) {
+    String html = htmlHeader("Import Failed");
+    html += "<p class='err'>"; html += (importErr[0] ? importErr : "Upload failed"); html += "</p>";
+    html += "<p><a href='/import'>Try again</a></p>";
+    html += htmlFooter();
+    httpServer.send(200, "text/html", html);
+    LittleFS.remove(IMPORT_TMP_FILE);
+    importInProgress = false;
+    return;
+  }
+
+  uint16_t newCount = 0, skipped = 0, clamped = 0;
+  char err[64] = "";
+  bool ok = importInventoryFile(IMPORT_TMP_FILE, newCount, skipped, clamped, err, sizeof(err));
+  LittleFS.remove(IMPORT_TMP_FILE);
+  importInProgress = false;
+
+  if (!ok) {
+    String html = htmlHeader("Import Failed");
+    html += "<p class='err'>"; html += err; html += "</p>";
+    html += "<p><a href='/import'>Try again</a></p>";
+    html += htmlFooter();
+    httpServer.send(200, "text/html", html);
+    return;
+  }
+
+  invalidatePhysicalSelectionIfNeeded();
+
+  String html = htmlHeader("Import Complete");
+  html += "<p>Imported " + String(newCount) + " record(s).</p>";
+  if (skipped) html += "<p class='warn'>Skipped " + String(skipped) + " record(s) with no name.</p>";
+  if (clamped) html += "<p class='warn'>Clamped " + String(clamped) + " out-of-range field(s).</p>";
+  html += "<p><a href='/inventory'>View inventory</a></p>";
+  html += htmlFooter();
+  httpServer.send(200, "text/html", html);
+}
+
+// Streams the current inventory as a downloadable JSON file — the exact
+// format /import expects back, so export-edit-reimport round-trips.
+void handleExport() {
+  httpServer.sendHeader("Content-Disposition", "attachment; filename=\"inventory-export.json\"");
+  httpServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  httpServer.send(200, "application/json", "");
+
+  httpServer.sendContent("[");
+  char nameJ[NAME_MAX_LEN * 2], locJ[LOC_MAX_LEN * 2], statusJ[STATUS_MAX_LEN * 2];
+  char chunk[300];
+  for (uint16_t i = 0; i < itemCount; i++) {
+    appendJsonEscaped(nameJ, sizeof(nameJ), items[i].name);
+    appendJsonEscaped(locJ, sizeof(locJ), items[i].location);
+    appendJsonEscaped(statusJ, sizeof(statusJ), items[i].status);
+    snprintf(chunk, sizeof(chunk),
+      "%s{\"name\":\"%s\",\"location\":\"%s\",\"qty\":%u,\"status\":\"%s\",\"lent\":%u}",
+      i > 0 ? "," : "", nameJ, locJ, items[i].qty, statusJ, items[i].lent);
+    httpServer.sendContent(chunk);
+  }
+  httpServer.sendContent("]");
+}
+
+void handleRestoreBackup() {
+  if (!LittleFS.exists(INVENTORY_BAK_FILE)) {
+    String html = htmlHeader("Restore Backup");
+    html += "<p class='err'>No backup file found.</p>";
+    html += "<p><a href='/inventory'>Back</a></p>";
+    html += htmlFooter();
+    httpServer.send(200, "text/html", html);
+    return;
+  }
+
+  String html = htmlHeader("Restore Backup");
+  html += "<p>Restore the inventory from the last backup? This replaces the "
+          "current inventory with whatever was saved immediately before the "
+          "most recent change.</p>";
+  html += "<form method='POST' action='/restore'>"
+          "<button type='submit'>Confirm Restore</button> <a href='/inventory'>Cancel</a></form>";
+  html += htmlFooter();
+  httpServer.send(200, "text/html", html);
+}
+
+void handleRestoreSubmit() {
+  if (!LittleFS.exists(INVENTORY_BAK_FILE)) {
+    httpServer.send(404, "text/plain", "No backup found");
+    return;
+  }
+  if (!tryLoadFrom(INVENTORY_BAK_FILE)) {
+    String html = htmlHeader("Restore Failed");
+    html += "<p class='err'>Backup file exists but failed to parse.</p>";
+    html += "<p><a href='/inventory'>Back</a></p>";
+    html += htmlFooter();
+    httpServer.send(200, "text/html", html);
+    return;
+  }
+
+  saveInventory(); // writes the restored data as the new primary (and rotates a fresh backup)
+  invalidatePhysicalSelectionIfNeeded();
+  httpServer.sendHeader("Location", "/inventory", true);
+  httpServer.send(303, "text/plain", "");
 }
