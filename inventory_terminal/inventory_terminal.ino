@@ -8,10 +8,8 @@
  *
  * ---- Stage 6, Increment 3 (this revision) ----
  *  - SETTINGS is now actually editable: idle timeout (5-600s, digit
- *    entry) and a buzzer mute toggle (vibration still happens even
- *    muted — alarms should never go both silent and invisible). Both
- *    are session-only; they reset to their #define defaults on reboot,
- *    not yet persisted to flash.
+ *    entry) and a buzzer mute toggle. Both are session-only; they reset
+ *    to their #define defaults on reboot, not yet persisted to flash.
  *  - RTC date is now settable from the Clock screen ('C', enter
  *    DDMMYY) alongside the existing time and alarm setters — writes
  *    only the date/month/year registers, leaving time untouched.
@@ -94,7 +92,7 @@
  * ---- Stage 1-2: physical terminal + robust storage ----
  * Keypad/OLED search (Nokia multi-tap), lend/return, safe LittleFS
  * writes (temp file -> verify -> backup rotate -> atomic rename),
- * corruption recovery, field validation, vibration feedback.
+ * corruption recovery, field validation.
  *
  * ---- Stage 3-4: Wi-Fi + full web management ----
  * On-demand Wi-Fi AP (OFF by default — see "Wi-Fi on demand" below) with
@@ -113,10 +111,9 @@
  * real time-of-day if an RTC is present, otherwise session uptime.
  * OLED dims (never blanks) after DISPLAY_DIM_TIMEOUT_MS; any key wakes
  * it back to full brightness, and any in-progress event — alarm, timer,
- * Pomodoro, stopwatch — forces full brightness automatically. Every keypress gives
- * a short haptic click via the vibration motor; the speaker is reserved
- * for alarms only. Alarms play a short repeating original jingle (not a
- * reproduction of any existing song) rather than a flat beep.
+ * Pomodoro, stopwatch — forces full brightness automatically. The speaker
+ * is reserved for alarms only, and alarms play a short repeating original
+ * jingle (not a reproduction of any existing song) rather than a flat beep.
  *
  * ---- Optional RTC, on its OWN dedicated I2C bus ----
  * A DS3231/DS1307-compatible RTC is entirely optional and now lives on
@@ -185,6 +182,7 @@
 #include "esp_timer.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+#include "esp_system.h"   // esp_reset_reason()
 
 // ============================================================
 //  CONFIGURATION — all pin/tunable definitions live here only
@@ -213,10 +211,14 @@
 
 #define VISIBLE_RESULT_LINES 3   // search's new terminal layout fits 3 result rows cleanly
 
-// ---- Vibration motor (coin-cell ERM motor via transistor driver) ----
-#define VIBRATION_MOTOR_PIN 4
-#define VIBRATE_CONFIRM_MS  150   // buzz on successful lend/return save
-#define VIBRATE_ERROR_MS    300   // buzz on validation/save error
+// ---- Vibration motor ----
+// REMOVED: this motor is not present in the hardware. Every startVibration()
+// call was writing to an unconnected GPIO, and the motor driver was one of
+// the two large current draws firing during alarms on an already-marginal
+// supply (suspected contributor to the post-Pomodoro restarts). Routine
+// confirm/error feedback now relies on triggerFlash() + the screen, and
+// alarms use the speaker alone. If haptics are ever added back, GPIO 4 is
+// the pin the driver was wired to.
 
 // ---- Wi-Fi access point + web server ----
 #define AP_SSID       "InventoryTerminal"
@@ -231,7 +233,8 @@
 #define SPEAKER_PIN         18
 
 // ---- Key feedback ----
-#define KEY_CLICK_VIBRATION_MS  15    // tiny haptic tick on every keypress
+// Was KEY_CLICK_VIBRATION_MS (haptic tick per keypress); removed with the
+// motor. Keypresses are already confirmed visually by the focus animation.
 
 // ---- Optional RTC (DS3231/DS1307) on its OWN dedicated I2C bus ----
 // Given on a shared bus with the OLED, use separate pins instead — rules
@@ -420,9 +423,7 @@ int8_t settingsSel = 0; // 0 = idle timeout, 1 = buzzer
 char settingsDigits[4] = "";
 uint8_t settingsDigitsLen = 0;
 
-// Vibration motor (non-blocking pulse via millis())
-bool vibrating = false;
-unsigned long vibrateUntil = 0;
+// Vibration motor state — removed (motor not fitted; see the GPIO defines).
 
 // Wi-Fi is OFF by default and only started on demand (power saving)
 bool wifiEnabled = false;
@@ -470,8 +471,6 @@ void adjustScroll();
 void setError(const char* msg);
 void triggerFlash(unsigned long ms);
 int availableOf(const InventoryItem &it);
-void startVibration(unsigned long ms);
-void updateVibration();
 void handleKey(char k);
 void handleSearchKey(char k);
 void handleDetailKey(char k);
@@ -578,15 +577,46 @@ void handleRestoreSubmit();
 // ============================================================
 //  SETUP / LOOP
 // ============================================================
-void setup() {
-  // Workaround for a reset-on-WiFi-start caused by a brief current spike
-  // when the radio powers on tripping the brownout detector on a
-  // marginal supply. This masks the symptom, not the root cause — see
-  // the chat reply for the real fix (better power supply/cable).
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
+// Human-readable name for the chip's reset cause. ESP_RST_BROWNOUT is the
+// one that matters for this board's power-margin problem: it means the 3V3
+// rail sagged below the brownout threshold, almost always under load.
+static const char* resetReasonToString(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:  return "POWERON (normal power-on)";
+    case ESP_RST_EXT:      return "EXT (external reset pin)";
+    case ESP_RST_SW:       return "SW (software reset)";
+    case ESP_RST_PANIC:    return "PANIC (crash/abort)";
+    case ESP_RST_INT_WDT:  return "INT_WDT (interrupts watchdog)";
+    case ESP_RST_TASK_WDT: return "TASK_WDT (task watchdog)";
+    case ESP_RST_WDT:      return "WDT (other watchdog)";
+    case ESP_RST_DEEPSLEEP:return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT (supply sag under load)";
+    case ESP_RST_SDIO:     return "SDIO";
+    default:               return "UNKNOWN";
+  }
+}
+
+void setup() {
+  // NOTE: the brownout detector is deliberately left ENABLED here.
+  // An earlier revision disabled it (WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0))
+  // to hide resets caused by the Wi-Fi radio's current spike on a marginal
+  // supply. That was backwards: it didn't prevent the sag, it just turned a
+  // clean, detectable reset into undefined mid-execution behaviour — so the
+  // board appeared to restart at random rather than at the moment of the
+  // spike. A clean brownout reset is a *symptom* worth having. Fix the supply
+  // (better cable/adapter, or a bulk cap) rather than blinding the detector.
   Serial.begin(115200);
   delay(100);
+
+  // Report WHY we booted. This is the single most useful line for diagnosing
+  // power-related resets: esp_reset_reason() distinguishes a supply sag
+  // (ESP_RST_BROWNOUT) from a watchdog timeout, a software panic, and a
+  // normal power-on. If resets ever come back, open Serial at 115200 and read
+  // this before changing any code.
+  Serial.println();
+  Serial.print("[boot] reset reason: ");
+  Serial.println(resetReasonToString(esp_reset_reason()));
 
   if (!LittleFS.begin(true)) {
     Serial.println("ERROR: LittleFS mount failed");
@@ -597,9 +627,6 @@ void setup() {
   u8g2.begin();
 
   keypad.setDebounceTime(KEYPAD_DEBOUNCE_MS);
-
-  pinMode(VIBRATION_MOTOR_PIN, OUTPUT);
-  digitalWrite(VIBRATION_MOTOR_PIN, LOW);
 
   loadInventory();
   if (!inventoryLoadFailed) reportDuplicates();
@@ -623,7 +650,6 @@ void setup() {
 }
 
 void loop() {
-  updateVibration(); // must run every cycle so a pulse always turns off in time
   updateTone();
   updateAlarm();
   updateTimer();
@@ -642,7 +668,6 @@ void loop() {
   char k = keypad.getKey();
   if (k != NO_KEY) {
     lastActivityMs = millis();
-    startVibration(KEY_CLICK_VIBRATION_MS); // haptic click on every keypress
     if (alarmActive) {
       dismissAlarm();                       // any key silences the alarm
     } else if (displayDim || state == STATE_IDLE) {
@@ -998,8 +1023,7 @@ int availableOf(const InventoryItem &it) {
 void setError(const char* msg) {
   strlcpy(errorMsg, msg, sizeof(errorMsg));
   errorMsgUntil = millis() + ERROR_MSG_DURATION_MS;
-  startVibration(VIBRATE_ERROR_MS); // vibration = routine feedback; buzzer stays reserved for alarms
-  triggerFlash(120);
+  triggerFlash(120); // on-screen flash is the error feedback; buzzer stays reserved for alarms
 }
 
 // A single quick full-screen invert, for "event" level feedback
@@ -1010,18 +1034,7 @@ void triggerFlash(unsigned long ms) {
   flashUntil = millis() + ms;
 }
 
-void startVibration(unsigned long ms) {
-  digitalWrite(VIBRATION_MOTOR_PIN, HIGH);
-  vibrating = true;
-  vibrateUntil = millis() + ms;
-}
-
-void updateVibration() {
-  if (vibrating && millis() >= vibrateUntil) {
-    digitalWrite(VIBRATION_MOTOR_PIN, LOW);
-    vibrating = false;
-  }
-}
+// startVibration()/updateVibration() removed along with the motor.
 
 // ============================================================
 //  KEY HANDLING
@@ -1175,8 +1188,7 @@ void handleQtyKey(char k, bool isLend) {
       return;
     }
     if (isLend) sessionLendUnits += qv; else sessionReturnUnits += qv;
-    startVibration(VIBRATE_CONFIRM_MS); // vibration = routine feedback; buzzer stays reserved for alarms
-    triggerFlash(100);
+    triggerFlash(100); // confirm feedback; buzzer stays reserved for alarms
     state = STATE_ITEM_DETAIL;
   }
 }
@@ -1325,7 +1337,7 @@ void drawNoDataScreen() {
 // ============================================================
 //  SESSION / IDLE / TOOLS
 //  (uptime/RTC idle screen, menu, timer, pomodoro, stopwatch, alarm,
-//   on-demand Wi-Fi, optional RTC clock/alarm, speaker + key-click vibration)
+//   on-demand Wi-Fi, optional RTC clock/alarm, speaker)
 // ============================================================
 
 // A short original jingle (not a reproduction of any specific song) used
@@ -1469,7 +1481,10 @@ void updateTimer() {
   }
 }
 
-// ---- Alarm (beep + vibrate pattern until any key is pressed) ----
+// ---- Alarm (speaker melody until any key is pressed) ----
+// Defined just below startAlarm(), which calls it — forward-declared here.
+void applyAlarmNote(const AlarmNote &n);
+
 void startAlarm(const char* msg) {
   alarmActive = true;
   alarmStartMs = millis();
@@ -1479,13 +1494,28 @@ void startAlarm(const char* msg) {
 
   alarmNoteIdx = 0;
   alarmNoteStartMs = millis();
+  applyAlarmNote(ALARM_MELODY[0]);
+}
+
+// Drives the speaker for a single melody note. freq == 0 means a rest, which
+// silences the pin.
+//
+// All tone/noTone calls funnel through here for one reason: on ESP32 core 3.x
+// both are asynchronous, queued to a dedicated tone task that owns the LEDC
+// peripheral. Calling tone() again without first stopping the previous note
+// leaves that note's hardware state running underneath the new one, which on
+// a marginal supply showed up as an unreliable alarm. Every note transition
+// now explicitly stops before it starts, so the peripheral is never asked to
+// change frequency while a tone is live.
+void applyAlarmNote(const AlarmNote &n) {
 #if SOUND_ENABLED
-  if (!buzzerMuted) {
-    if (ALARM_MELODY[0].freq > 0) tone(SPEAKER_PIN, ALARM_MELODY[0].freq);
-    else noTone(SPEAKER_PIN);
+  if (buzzerMuted) {
+    noTone(SPEAKER_PIN); // never leave a tone running just because mute was toggled mid-alarm
+    return;
   }
+  noTone(SPEAKER_PIN); // stop the previous note first (see comment above)
+  if (n.freq > 0) tone(SPEAKER_PIN, n.freq);
 #endif
-  startVibration(120); // vibration still happens even muted — alarms should never be silent AND invisible
 }
 
 void stopAlarm() {
@@ -1521,20 +1551,12 @@ void updateAlarm() {
     return;
   }
 
-  // Step through the melody — each note plays for its own duration, then
-  // we advance (looping) to the next, with a brief vibration pulse on
-  // every sounded (non-rest) note so it's also felt, not just heard.
+  // Step through the melody — each note plays for its own duration, then we
+  // advance (looping) to the next.
   if (now - alarmNoteStartMs >= ALARM_MELODY[alarmNoteIdx].durMs) {
     alarmNoteIdx = (alarmNoteIdx + 1) % ALARM_MELODY_LEN;
     alarmNoteStartMs = now;
-    const AlarmNote &n = ALARM_MELODY[alarmNoteIdx];
-#if SOUND_ENABLED
-    if (!buzzerMuted) {
-      if (n.freq > 0) tone(SPEAKER_PIN, n.freq);
-      else noTone(SPEAKER_PIN);
-    }
-#endif
-    if (n.freq > 0) startVibration(n.durMs < 150 ? n.durMs : 150);
+    applyAlarmNote(ALARM_MELODY[alarmNoteIdx]);
   }
 }
 
@@ -1698,7 +1720,6 @@ void handleClockKey(char k) {
       int yy = (clockDigits[4] - '0') * 10 + (clockDigits[5] - '0');
       if (dd < 1 || dd > 31 || mo < 1 || mo > 12) { setError("Invalid date"); return; }
       if (!writeRtcDate((uint8_t)dd, (uint8_t)mo, (uint8_t)yy)) { setError("RTC write failed"); return; }
-      startVibration(VIBRATE_CONFIRM_MS);
       triggerFlash(100);
       clockSubMode = CLOCK_VIEW;
       return;
@@ -1710,14 +1731,13 @@ void handleClockKey(char k) {
 
     if (clockSubMode == CLOCK_SET_TIME) {
       if (!writeRtcTime((uint8_t)hh, (uint8_t)mm, 0)) { setError("RTC write failed"); return; }
-      startVibration(VIBRATE_CONFIRM_MS);
     } else { // CLOCK_SET_ALARM
       rtcAlarmHour = (uint8_t)hh;
       rtcAlarmMin = (uint8_t)mm;
       rtcAlarmEnabled = true;
       lastAlarmFiredMinute = 255;
-      startVibration(VIBRATE_CONFIRM_MS);
     }
+    triggerFlash(100);
     clockSubMode = CLOCK_VIEW;
   }
 }
