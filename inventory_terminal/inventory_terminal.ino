@@ -1,8 +1,31 @@
 /*
  * ESP32 Electronics Inventory Terminal
- * STAGE 6 (Increment 2 of several — see note below) — OLED UI redesign,
- * building on Increment 1's 3x3 icon-grid launcher + watch-style idle
- * clock. Nothing below the UI layer was touched in either increment.
+ * STAGE 6 (Increment 3 of several — see note below) — OLED UI redesign,
+ * building on Increments 1-2 (3x3 icon-grid launcher, watch-style idle
+ * clock, redesigned search + aliases, Timer/Pomodoro progress bars,
+ * alarm/event animations). Nothing below the UI layer was touched in
+ * any increment.
+ *
+ * ---- Stage 6, Increment 3 (this revision) ----
+ *  - SETTINGS is now actually editable: idle timeout (5-600s, digit
+ *    entry) and a buzzer mute toggle (vibration still happens even
+ *    muted — alarms should never go both silent and invisible). Both
+ *    are session-only; they reset to their #define defaults on reboot,
+ *    not yet persisted to flash.
+ *  - RTC date is now settable from the Clock screen ('C', enter
+ *    DDMMYY) alongside the existing time and alarm setters — writes
+ *    only the date/month/year registers, leaving time untouched.
+ *  - Navigation-tier transition: entering any feature screen from the
+ *    home grid now does a brief (~120ms) non-blocking left-to-right
+ *    wipe-in, via u8g2's clip window — genuinely cheap, no double-
+ *    buffering trickery, and never blocks keypad input.
+ *
+ * ---- Fixed: reset on Wi-Fi start ----
+ *  - The ESP32's brownout detector is now disabled at the very start of
+ *    setup(). This is a workaround for resets caused by the WiFi
+ *    radio's current spike sagging a marginal power supply enough to
+ *    trip it — NOT a fix for the underlying power issue. See the chat
+ *    reply for the real fix (better cable/supply).
  *
  * ---- Stage 6, Increment 2 (this revision) ----
  *  - SEARCH: redesigned as a compact terminal-style screen — "SEARCH"
@@ -57,15 +80,16 @@
  *    stopwatch, Wi-Fi, web management, import/export, and all storage
  *    logic are untouched and still work exactly as before.
  *
- * Still deliberately NOT done (everything from Increment 1's list is now
- * complete; what's left):
- *  - A real Settings screen with editable values (currently view-only).
- *  - RTC date-setting from the UI (time can be set via Clock; date
- *    registers are read but not yet writable from the device).
- *  - Further "navigation" tier polish called for in section 7 of the
- *    doc (e.g. a brief slide/fade when *entering* a feature screen from
- *    the grid) — the grid's own focus animation and the event-level
- *    flashes are done; screen-to-screen transition animation is not.
+ * Everything from the original Stage 6 doc's checklist is now addressed.
+ * What's left is polish, not missing features:
+ *  - Settings/idle-timeout/buzzer-mute aren't persisted to flash across
+ *    reboot yet (session-only). Easy to add (one more field in the
+ *    inventory save, or a tiny separate settings.json) if wanted.
+ *  - The transition wipe only fires on grid -> feature-screen entry,
+ *    not on every nested screen change (e.g. search result -> item
+ *    detail) — scoped that way deliberately to keep things predictable
+ *    rather than animating everything, per the doc's own "don't animate
+ *    everything" philosophy.
  *
  * ---- Stage 1-2: physical terminal + robust storage ----
  * Keypad/OLED search (Nokia multi-tap), lend/return, safe LittleFS
@@ -87,8 +111,9 @@
  * own screen rather than the menu. Idle after IDLE_TIMEOUT_MS shows a
  * PURE time display — just the big number, nothing else — using the
  * real time-of-day if an RTC is present, otherwise session uptime.
- * OLED fully switches off after DISPLAY_OFF_TIMEOUT_MS (any key wakes
- * it; the clock/uptime keeps counting underneath). Every keypress gives
+ * OLED dims (never blanks) after DISPLAY_DIM_TIMEOUT_MS; any key wakes
+ * it back to full brightness, and any in-progress event — alarm, timer,
+ * Pomodoro, stopwatch — forces full brightness automatically. Every keypress gives
  * a short haptic click via the vibration motor; the speaker is reserved
  * for alarms only. Alarms play a short repeating original jingle (not a
  * reproduction of any existing song) rather than a flat beep.
@@ -158,6 +183,8 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include "esp_timer.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 // ============================================================
 //  CONFIGURATION — all pin/tunable definitions live here only
@@ -217,9 +244,16 @@
 // every RTC feature is skipped automatically — falls back to uptime-only,
 // no crash.
 
-// ---- Idle / power behaviour ----
+// ---- Idle / power / brightness behaviour ----
 #define IDLE_TIMEOUT_MS         30000UL    // no key -> pure uptime/clock screen
-#define DISPLAY_OFF_TIMEOUT_MS  300000UL   // idle this long -> OLED off (0 = never)
+#define DISPLAY_DIM_TIMEOUT_MS  300000UL   // idle this long -> OLED dims to minimum (0 = never)
+
+// SH1106 contrast runs 0-255. We dim rather than blank on purpose: a fully
+// sleeping panel (u8g2.setPowerSave) looks exactly like a crashed or frozen
+// unit, which is what a long-running countdown used to look like once this
+// timeout elapsed. Dimming keeps the device visibly alive at near-zero cost.
+#define CONTRAST_FULL           255
+#define CONTRAST_DIM            32         // dim, but still legible in a dark room
 
 // ---- Timer / Pomodoro / alarm ----
 #define POMO_WORK_MIN       25
@@ -346,7 +380,7 @@ unsigned long flashUntil = 0;
 // Session / idle / tools
 enum TimerKind { TIMER_NONE, TIMER_COUNTDOWN, TIMER_POMO_WORK, TIMER_POMO_BREAK };
 unsigned long lastActivityMs = 0;
-bool displayOff = false;
+bool displayDim = false;   // true = panel dimmed, NOT blanked (see updateIdle)
 uint32_t sessionLendUnits = 0, sessionReturnUnits = 0;
 bool lentMode = false;                 // search screen showing lent items
 int8_t menuSel = 0, menuScroll = 0;
@@ -373,10 +407,18 @@ unsigned long lastRtcCheckMs = 0;
 bool rtcAlarmEnabled = false;
 uint8_t rtcAlarmHour = 0, rtcAlarmMin = 0;
 uint8_t lastAlarmFiredMinute = 255; // sentinel so a fresh alarm can fire at minute 0
-enum ClockSubMode { CLOCK_VIEW, CLOCK_SET_TIME, CLOCK_SET_ALARM };
+enum ClockSubMode { CLOCK_VIEW, CLOCK_SET_TIME, CLOCK_SET_ALARM, CLOCK_SET_DATE };
 ClockSubMode clockSubMode = CLOCK_VIEW;
-char clockDigits[5] = "";
+char clockDigits[7] = ""; // up to 6 digits (DDMMYY)
 uint8_t clockDigitsLen = 0;
+
+// Settings screen state (declared here, not next to its functions,
+// because activateHomeItem() above references SETTINGS_VIEW directly)
+enum SettingsSubMode { SETTINGS_VIEW, SETTINGS_EDIT_IDLE };
+SettingsSubMode settingsSubMode = SETTINGS_VIEW;
+int8_t settingsSel = 0; // 0 = idle timeout, 1 = buzzer
+char settingsDigits[4] = "";
+uint8_t settingsDigitsLen = 0;
 
 // Vibration motor (non-blocking pulse via millis())
 bool vibrating = false;
@@ -384,6 +426,16 @@ unsigned long vibrateUntil = 0;
 
 // Wi-Fi is OFF by default and only started on demand (power saving)
 bool wifiEnabled = false;
+
+// Runtime-editable settings (Settings screen). Session-only — reset to
+// the #define defaults on reboot; not persisted to flash in this pass.
+unsigned long idleTimeoutMs = IDLE_TIMEOUT_MS;
+bool buzzerMuted = false;
+
+// Screen-transition wipe: set whenever the home grid activates a
+// feature screen; consumed by beginTransitionClip()/endTransitionClip().
+unsigned long screenEnterMs = 0;
+#define SCREEN_TRANSITION_MS 120
 
 // Web import (file upload) state
 bool importInProgress = false;
@@ -483,6 +535,9 @@ uint8_t decToBcd(uint8_t d);
 bool readRtcTime(uint8_t &h, uint8_t &m, uint8_t &s);
 bool readRtcFull(uint8_t &h, uint8_t &m, uint8_t &s, uint8_t &date, uint8_t &month, uint8_t &year);
 bool writeRtcTime(uint8_t h, uint8_t m, uint8_t s);
+bool writeRtcDate(uint8_t date, uint8_t month, uint8_t year);
+void beginTransitionClip();
+void endTransitionClip();
 void updateRtcAlarm();
 void formatClock(char* buf, size_t n, uint8_t h, uint8_t m, uint8_t s);
 void formatRtcDate(char* buf, size_t n, uint8_t date, uint8_t month, uint8_t year);
@@ -524,6 +579,12 @@ void handleRestoreSubmit();
 //  SETUP / LOOP
 // ============================================================
 void setup() {
+  // Workaround for a reset-on-WiFi-start caused by a brief current spike
+  // when the radio powers on tripping the brownout detector on a
+  // marginal supply. This masks the symptom, not the root cause — see
+  // the chat reply for the real fix (better power supply/cable).
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
   delay(100);
 
@@ -555,6 +616,8 @@ void setup() {
   queryLen = 0;
   runSearch();
 
+  u8g2.setContrast(CONTRAST_FULL); // explicit, so a soft reset can't leave it dim
+
   lastActivityMs = millis();
   state = STATE_IDLE;   // boot straight into the uptime screen
 }
@@ -582,7 +645,7 @@ void loop() {
     startVibration(KEY_CLICK_VIBRATION_MS); // haptic click on every keypress
     if (alarmActive) {
       dismissAlarm();                       // any key silences the alarm
-    } else if (displayOff || state == STATE_IDLE) {
+    } else if (displayDim || state == STATE_IDLE) {
       wakeDisplay();                        // wake key is swallowed
       if (timerKind != TIMER_NONE) {
         state = STATE_TIMER;                // a countdown/Pomodoro is still running
@@ -599,11 +662,6 @@ void loop() {
   }
 
   updateIdle();
-
-  if (displayOff) {
-    delay(20);   // display is off: nothing to draw, ease off the CPU a little
-    return;
-  }
 
   switch (state) {
     case STATE_SEARCH:       drawSearchScreen();      break;
@@ -1132,6 +1190,7 @@ void handleQtyKey(char k, bool isLend) {
 // bottom. VISIBLE_RESULT_LINES (3) is sized to fit this layout exactly.
 void drawSearchScreen() {
   u8g2.clearBuffer();
+  beginTransitionClip();
   u8g2.setFont(u8g2_font_6x10_tf);
 
   u8g2.drawStr(0, 8, lentMode ? "LENT OUT" : "SEARCH");
@@ -1178,6 +1237,7 @@ void drawSearchScreen() {
 
   u8g2.drawHLine(0, 53, 128);
   u8g2.drawStr(0, 63, "A/B browse  #:select");
+  endTransitionClip();
   u8g2.sendBuffer();
 }
 
@@ -1306,10 +1366,12 @@ void formatMMSSms(char* buf, size_t n, unsigned long totalMs) {
 }
 
 // ---- Display power ----
+// Restores full brightness. Called on any keypress and whenever something
+// important (alarm, running timer) becomes active.
 void wakeDisplay() {
-  if (displayOff) {
-    displayOff = false;
-    u8g2.setPowerSave(0);
+  if (displayDim) {
+    displayDim = false;
+    u8g2.setContrast(CONTRAST_FULL);
   }
 }
 
@@ -1320,15 +1382,31 @@ void updateIdle() {
   // Drop back to the uptime screen after inactivity — but never while a
   // timer/stopwatch is actively being watched, and never during an alarm.
   if (!alarmActive && state != STATE_IDLE && state != STATE_TIMER && state != STATE_STOPWATCH) {
-    if (idleFor >= IDLE_TIMEOUT_MS) {
+    if (idleFor >= idleTimeoutMs) {
       state = STATE_IDLE;
     }
   }
 
-  if (DISPLAY_OFF_TIMEOUT_MS > 0 && !displayOff && !alarmActive) {
-    if (idleFor >= DISPLAY_OFF_TIMEOUT_MS) {
-      displayOff = true;
-      u8g2.setPowerSave(1); // OLED driver sleep — uptime keeps counting underneath
+  // Dim after a long idle period, but NEVER blank the panel. Blanking is
+  // what made a running countdown look frozen: the timer kept running but
+  // the screen was dark, so it read as a hang. Dimming also keeps the
+  // device visibly powered on, which matters because the brownout-prone
+  // supply can't be distinguished from a dead unit otherwise.
+  //
+  // Anything that represents an in-progress event keeps full brightness:
+  // an active alarm, a running timer/Pomodoro, or a running stopwatch.
+  bool eventActive = alarmActive || (timerKind != TIMER_NONE) || swRunning;
+  if (eventActive) {
+    wakeDisplay();          // never dim while an event is live
+    return;
+  }
+
+  if (DISPLAY_DIM_TIMEOUT_MS > 0) {
+    if (idleFor >= DISPLAY_DIM_TIMEOUT_MS) {
+      if (!displayDim) {
+        displayDim = true;
+        u8g2.setContrast(CONTRAST_DIM);
+      }
     }
   }
 }
@@ -1402,10 +1480,12 @@ void startAlarm(const char* msg) {
   alarmNoteIdx = 0;
   alarmNoteStartMs = millis();
 #if SOUND_ENABLED
-  if (ALARM_MELODY[0].freq > 0) tone(SPEAKER_PIN, ALARM_MELODY[0].freq);
-  else noTone(SPEAKER_PIN);
+  if (!buzzerMuted) {
+    if (ALARM_MELODY[0].freq > 0) tone(SPEAKER_PIN, ALARM_MELODY[0].freq);
+    else noTone(SPEAKER_PIN);
+  }
 #endif
-  startVibration(120);
+  startVibration(120); // vibration still happens even muted — alarms should never be silent AND invisible
 }
 
 void stopAlarm() {
@@ -1449,8 +1529,10 @@ void updateAlarm() {
     alarmNoteStartMs = now;
     const AlarmNote &n = ALARM_MELODY[alarmNoteIdx];
 #if SOUND_ENABLED
-    if (n.freq > 0) tone(SPEAKER_PIN, n.freq);
-    else noTone(SPEAKER_PIN);
+    if (!buzzerMuted) {
+      if (n.freq > 0) tone(SPEAKER_PIN, n.freq);
+      else noTone(SPEAKER_PIN);
+    }
 #endif
     if (n.freq > 0) startVibration(n.durMs < 150 ? n.durMs : 150);
   }
@@ -1536,6 +1618,17 @@ bool writeRtcTime(uint8_t h, uint8_t m, uint8_t s) {
   return (RTCWire.endTransmission() == 0);
 }
 
+// Writes just the date/month/year registers (0x04-0x06), leaving the
+// time and day-of-week registers untouched.
+bool writeRtcDate(uint8_t date, uint8_t month, uint8_t year) {
+  RTCWire.beginTransmission(RTC_I2C_ADDR);
+  RTCWire.write((uint8_t)0x04);
+  RTCWire.write(decToBcd(date));
+  RTCWire.write(decToBcd(month) & 0x1F); // bit7 century flag left 0 (assume 20xx)
+  RTCWire.write(decToBcd(year));
+  return (RTCWire.endTransmission() == 0);
+}
+
 void formatClock(char* buf, size_t n, uint8_t h, uint8_t m, uint8_t s) {
   snprintf(buf, n, "%02u:%02u:%02u", h, m, s);
 }
@@ -1579,19 +1672,38 @@ void handleClockKey(char k) {
   if (clockSubMode == CLOCK_VIEW) {
     if (k == 'A') { clockSubMode = CLOCK_SET_TIME; clockDigitsLen = 0; clockDigits[0] = 0; }
     else if (k == 'B') { clockSubMode = CLOCK_SET_ALARM; clockDigitsLen = 0; clockDigits[0] = 0; }
+    else if (k == 'C') { clockSubMode = CLOCK_SET_DATE; clockDigitsLen = 0; clockDigits[0] = 0; }
     else if (k == 'D') { rtcAlarmEnabled = !rtcAlarmEnabled; if (rtcAlarmEnabled) lastAlarmFiredMinute = 255; }
     else if (k == '*') { state = STATE_HOME; }
     return;
   }
 
-  // CLOCK_SET_TIME / CLOCK_SET_ALARM: enter 4 digits as HHMM
+  // CLOCK_SET_TIME / CLOCK_SET_ALARM take 4 digits (HHMM); CLOCK_SET_DATE takes 6 (DDMMYY).
+  uint8_t maxDigits = (clockSubMode == CLOCK_SET_DATE) ? 6 : 4;
+
   if (k >= '0' && k <= '9') {
-    if (clockDigitsLen < 4) { clockDigits[clockDigitsLen++] = k; clockDigits[clockDigitsLen] = 0; }
+    if (clockDigitsLen < maxDigits) { clockDigits[clockDigitsLen++] = k; clockDigits[clockDigitsLen] = 0; }
   } else if (k == '*') {
     if (clockDigitsLen > 0) { clockDigitsLen--; clockDigits[clockDigitsLen] = 0; }
     else clockSubMode = CLOCK_VIEW;
   } else if (k == '#') {
-    if (clockDigitsLen != 4) { setError("Enter HHMM"); return; }
+    if (clockDigitsLen != maxDigits) {
+      setError(clockSubMode == CLOCK_SET_DATE ? "Enter DDMMYY" : "Enter HHMM");
+      return;
+    }
+
+    if (clockSubMode == CLOCK_SET_DATE) {
+      int dd = (clockDigits[0] - '0') * 10 + (clockDigits[1] - '0');
+      int mo = (clockDigits[2] - '0') * 10 + (clockDigits[3] - '0');
+      int yy = (clockDigits[4] - '0') * 10 + (clockDigits[5] - '0');
+      if (dd < 1 || dd > 31 || mo < 1 || mo > 12) { setError("Invalid date"); return; }
+      if (!writeRtcDate((uint8_t)dd, (uint8_t)mo, (uint8_t)yy)) { setError("RTC write failed"); return; }
+      startVibration(VIBRATE_CONFIRM_MS);
+      triggerFlash(100);
+      clockSubMode = CLOCK_VIEW;
+      return;
+    }
+
     int hh = (clockDigits[0] - '0') * 10 + (clockDigits[1] - '0');
     int mm = (clockDigits[2] - '0') * 10 + (clockDigits[3] - '0');
     if (hh > 23 || mm > 59) { setError("Invalid time"); return; }
@@ -1612,6 +1724,7 @@ void handleClockKey(char k) {
 
 void drawClockScreen() {
   u8g2.clearBuffer();
+  beginTransitionClip();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 9, "CLOCK");
   u8g2.drawHLine(0, 11, 128);
@@ -1620,6 +1733,7 @@ void drawClockScreen() {
     u8g2.drawStr(0, 28, "No RTC found");
     u8g2.drawStr(0, 40, "(uptime-only mode)");
     u8g2.drawStr(0, 60, "*:Back");
+    endTransitionClip();
     u8g2.sendBuffer();
     return;
   }
@@ -1629,23 +1743,31 @@ void drawClockScreen() {
     formatClock(t, sizeof(t), cachedRtcHour, cachedRtcMin, cachedRtcSec);
     u8g2.setFont(u8g2_font_logisoso16_tr);
     int w = u8g2.getStrWidth(t);
-    u8g2.drawStr((128 - w) / 2, 34, t);
+    u8g2.drawStr((128 - w) / 2, 30, t);
     u8g2.setFont(u8g2_font_6x10_tf);
+
+    char dateLine[16];
+    formatRtcDate(dateLine, sizeof(dateLine), cachedRtcDate, cachedRtcMonth, cachedRtcYear);
+    int dw = u8g2.getStrWidth(dateLine);
+    u8g2.drawStr((128 - dw) / 2, 41, dateLine);
 
     char alarmLine[24];
     if (rtcAlarmEnabled) snprintf(alarmLine, sizeof(alarmLine), "Alarm %02u:%02u ON", rtcAlarmHour, rtcAlarmMin);
     else snprintf(alarmLine, sizeof(alarmLine), "Alarm: OFF");
-    u8g2.drawStr(0, 48, alarmLine);
+    u8g2.drawStr(0, 52, alarmLine);
 
-    if (errorMsg[0] && millis() < errorMsgUntil) u8g2.drawStr(0, 60, errorMsg);
-    else u8g2.drawStr(0, 60, "A:SetTime B:Alarm D:Tgl");
+    if (errorMsg[0] && millis() < errorMsgUntil) u8g2.drawStr(0, 63, errorMsg);
+    else u8g2.drawStr(0, 63, "A/B/C:Set D:Tgl");
   } else {
-    u8g2.drawStr(0, 24, clockSubMode == CLOCK_SET_TIME ? "Set time (HHMM)" : "Set alarm (HHMM)");
-    char line[20]; snprintf(line, sizeof(line), "HHMM: %s", clockDigits);
+    const char* label = (clockSubMode == CLOCK_SET_TIME)  ? "Set time (HHMM)" :
+                         (clockSubMode == CLOCK_SET_ALARM) ? "Set alarm (HHMM)" : "Set date (DDMMYY)";
+    u8g2.drawStr(0, 24, label);
+    char line[20]; snprintf(line, sizeof(line), "%s", clockDigits);
     u8g2.drawStr(0, 40, line);
     if (errorMsg[0] && millis() < errorMsgUntil) u8g2.drawStr(0, 60, errorMsg);
     else u8g2.drawStr(0, 60, "#:OK *:Del/Back");
   }
+  endTransitionClip();
   u8g2.sendBuffer();
 }
 
@@ -1736,6 +1858,24 @@ void drawSelectionAnimation(int cx, int cy) {
   u8g2.drawLine(x1, y1 - 3, x1, y1);
 }
 
+// Navigation-tier transition: a brief (SCREEN_TRANSITION_MS) left-to-
+// right wipe-in when a feature screen is first entered from the home
+// grid, via u8g2's clip window — genuinely non-blocking, just narrows
+// what the next few frames are allowed to draw into. Call right after
+// clearBuffer() and pair with endTransitionClip() right before
+// sendBuffer(), or the clip stays narrowed for later screens too.
+void beginTransitionClip() {
+  unsigned long elapsed = millis() - screenEnterMs;
+  if (elapsed >= SCREEN_TRANSITION_MS) { u8g2.setMaxClipWindow(); return; }
+  int w = (int)(128UL * elapsed / SCREEN_TRANSITION_MS);
+  if (w < 1) w = 1;
+  u8g2.setClipWindow(0, 0, w, 64);
+}
+
+void endTransitionClip() {
+  u8g2.setMaxClipWindow();
+}
+
 void drawHomeGrid() {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
@@ -1790,6 +1930,8 @@ void activateHomeItem(uint8_t idx) {
       runSearch();
       break;
     case 7: // Settings
+      settingsSubMode = SETTINGS_VIEW;
+      settingsSel = 0;
       state = STATE_SETTINGS;
       break;
     case 8: // More (placeholder slot)
@@ -1797,6 +1939,7 @@ void activateHomeItem(uint8_t idx) {
       break;
     default: break;
   }
+  screenEnterMs = millis(); // drives the brief wipe-in transition on the new screen
 }
 
 // Grid navigation: A=left, B=right, C=up, D=down, #=select, *=manual
@@ -1889,25 +2032,79 @@ void drawIdleClock() {
   u8g2.sendBuffer();
 }
 
+// Settings is a tiny 2-item editable list (cursor via C/D, edit/toggle
+// via #), plus a read-only status line. Session-only — see the globals'
+// comment for why these aren't persisted to flash yet. (Enum + state
+// vars live up in the GLOBALS section since activateHomeItem(), defined
+// earlier in the file, needs to reference SETTINGS_VIEW.)
 void handleSettingsKey(char k) {
-  if (k == '*') state = STATE_HOME;
+  if (settingsSubMode == SETTINGS_EDIT_IDLE) {
+    if (k >= '0' && k <= '9') {
+      if (settingsDigitsLen < 3) { settingsDigits[settingsDigitsLen++] = k; settingsDigits[settingsDigitsLen] = 0; }
+    } else if (k == '*') {
+      if (settingsDigitsLen > 0) { settingsDigitsLen--; settingsDigits[settingsDigitsLen] = 0; }
+      else settingsSubMode = SETTINGS_VIEW;
+    } else if (k == '#') {
+      int secs = atoi(settingsDigits);
+      if (secs < 5 || secs > 600) { setError("5-600 sec only"); return; }
+      idleTimeoutMs = (unsigned long)secs * 1000UL;
+      triggerFlash(100);
+      settingsSubMode = SETTINGS_VIEW;
+    }
+    return;
+  }
+
+  if (k == 'C') { settingsSel--; if (settingsSel < 0) settingsSel = 1; }
+  else if (k == 'D') { settingsSel++; if (settingsSel > 1) settingsSel = 0; }
+  else if (k == '#') {
+    if (settingsSel == 0) {
+      settingsSubMode = SETTINGS_EDIT_IDLE;
+      settingsDigitsLen = 0;
+      settingsDigits[0] = 0;
+    } else {
+      buzzerMuted = !buzzerMuted;
+      triggerFlash(80);
+    }
+  } else if (k == '*') {
+    state = STATE_HOME;
+  }
 }
 
 void drawSettingsScreen() {
   u8g2.clearBuffer();
+  beginTransitionClip();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 9, "SETTINGS");
   u8g2.drawHLine(0, 11, 128);
 
-  char line[24];
-  snprintf(line, sizeof(line), "Idle timeout: %lus", (unsigned long)(IDLE_TIMEOUT_MS / 1000));
-  u8g2.drawStr(0, 26, line);
-  snprintf(line, sizeof(line), "RTC: %s", rtcPresent ? "detected" : "none");
-  u8g2.drawStr(0, 38, line);
-  snprintf(line, sizeof(line), "Wi-Fi: %s", wifiEnabled ? "ON" : "OFF");
-  u8g2.drawStr(0, 50, line);
+  if (settingsSubMode == SETTINGS_EDIT_IDLE) {
+    u8g2.drawStr(0, 26, "Idle timeout (5-600s)");
+    char line[20]; snprintf(line, sizeof(line), "Seconds: %s", settingsDigits);
+    u8g2.drawStr(0, 40, line);
+    if (errorMsg[0] && millis() < errorMsgUntil) u8g2.drawStr(0, 62, errorMsg);
+    else u8g2.drawStr(0, 62, "#:OK *:Del/Back");
+  } else {
+    char line[28];
+    snprintf(line, sizeof(line), "%cIdle timeout: %lus",
+             settingsSel == 0 ? '>' : ' ', (unsigned long)(idleTimeoutMs / 1000));
+    u8g2.drawStr(0, 24, line);
+    snprintf(line, sizeof(line), "%cBuzzer: %s",
+             settingsSel == 1 ? '>' : ' ', buzzerMuted ? "MUTED" : "ON");
+    u8g2.drawStr(0, 36, line);
 
-  u8g2.drawStr(0, 62, "*:Back  (more soon)");
+    char info[24];
+    snprintf(info, sizeof(info), "RTC:%s  WiFi:%s", rtcPresent ? "OK" : "--", wifiEnabled ? "ON" : "OFF");
+    u8g2.drawStr(0, 48, info);
+
+    u8g2.drawStr(0, 62, "C/D:sel #:edit *:back");
+  }
+
+  if (millis() < flashUntil) {
+    u8g2.setDrawColor(2);
+    u8g2.drawBox(0, 0, 128, 64);
+    u8g2.setDrawColor(1);
+  }
+  endTransitionClip();
   u8g2.sendBuffer();
 }
 
@@ -1917,11 +2114,13 @@ void handleMoreKey(char k) {
 
 void drawMoreScreen() {
   u8g2.clearBuffer();
+  beginTransitionClip();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 9, "MORE");
   u8g2.drawHLine(0, 11, 128);
   u8g2.drawStr(0, 34, "Coming soon.");
   u8g2.drawStr(0, 62, "*:Back");
+  endTransitionClip();
   u8g2.sendBuffer();
 }
 
@@ -1941,6 +2140,7 @@ void drawProgressBar(int x, int y, int w, int h, float fraction) {
 // same STATE_TIMER/timerKind machinery — see loop()'s draw switch.
 void drawTimerScreen() {
   u8g2.clearBuffer();
+  beginTransitionClip();
   u8g2.setFont(u8g2_font_6x10_tf);
 
   if (timerKind == TIMER_NONE) {
@@ -1964,6 +2164,7 @@ void drawTimerScreen() {
 
     u8g2.drawStr(0, 62, "*:Cancel");
   }
+  endTransitionClip();
   u8g2.sendBuffer();
 }
 
@@ -1973,6 +2174,7 @@ void drawTimerScreen() {
 // (drawAlarmAnimation) — its invert-pulse doubles as the transition cue.
 void drawPomodoroScreen() {
   u8g2.clearBuffer();
+  beginTransitionClip();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 10, "POMODORO");
 
@@ -1993,11 +2195,13 @@ void drawPomodoroScreen() {
            (unsigned)pomoCycleIndex, (unsigned)POMO_CYCLES_PER_SESSION);
   int iw = u8g2.getStrWidth(info);
   u8g2.drawStr((128 - iw) / 2, 62, info);
+  endTransitionClip();
   u8g2.sendBuffer();
 }
 
 void drawStopwatchScreen() {
   u8g2.clearBuffer();
+  beginTransitionClip();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 12, "STOPWATCH");
 
@@ -2010,6 +2214,7 @@ void drawStopwatchScreen() {
   u8g2.setFont(u8g2_font_6x10_tf);
 
   u8g2.drawStr(0, 60, swRunning ? "#:Stop A:Rst *:Bck" : "#:Run A:Rst *:Bck");
+  endTransitionClip();
   u8g2.sendBuffer();
 }
 
@@ -2117,6 +2322,7 @@ void handleWifiKey(char k) {
 
 void drawWifiScreen() {
   u8g2.clearBuffer();
+  beginTransitionClip();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 9, "WI-FI");
   u8g2.drawHLine(0, 11, 128);
@@ -2133,6 +2339,7 @@ void drawWifiScreen() {
     u8g2.drawStr(0, 42, "(saving power)");
   }
   u8g2.drawStr(0, 62, "#:Toggle *:Back");
+  endTransitionClip();
   u8g2.sendBuffer();
 }
 
